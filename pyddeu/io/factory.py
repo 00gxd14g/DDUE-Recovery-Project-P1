@@ -4,13 +4,14 @@ from pathlib import Path
 
 from ..platform import IS_WINDOWS
 from .base import DiskSource, SourceInfo
+from ..config import PyddeuConfig
 
 
-def open_source(path: str) -> DiskSource:
+def open_source(path: str, *, config: PyddeuConfig | None = None) -> DiskSource:
     if IS_WINDOWS:
         from .windows import open_windows_source
 
-        return open_windows_source(path)
+        return open_windows_source(path, config=config)
 
     from .posix import open_posix_source
 
@@ -39,4 +40,3 @@ def list_sources() -> list[SourceInfo]:
                 continue
             sources.append(SourceInfo(path=f"/dev/{name}", size=sectors * 512, description="block"))
     return sources
-

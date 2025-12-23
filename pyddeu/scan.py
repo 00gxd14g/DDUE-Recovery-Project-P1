@@ -110,6 +110,26 @@ def safe_read_granular(
     if sec <= 0:
         sec = 512
 
+    cfg = getattr(state, "config", None)
+    retries = int(getattr(cfg, "retries", 0) or 0)
+    deviojump_sectors = int(getattr(cfg, "deviojump_sectors", 0) or 0)
+    bad_filler = getattr(cfg, "deviobadfiller", None)
+    skip_filler = getattr(cfg, "devioskipfiller", None)
+
+    def fill_pattern(dst: bytearray, start: int, length: int, pattern_u32: Optional[int]) -> None:
+        if length <= 0:
+            return
+        if pattern_u32 is None:
+            return
+        pat = int(pattern_u32) & 0xFFFFFFFF
+        p = pat.to_bytes(4, "little", signed=False)
+        end2 = start + length
+        i = start
+        while i < end2:
+            chunk = min(4, end2 - i)
+            dst[i : i + chunk] = p[:chunk]
+            i += chunk
+
     buf = bytearray(b"\x00" * size)
     end = offset + size
     cur = offset
@@ -118,21 +138,49 @@ def safe_read_granular(
         to_read = min(sec, end - cur)
         rel = cur - offset
         if state.bad_map.contains(cur, to_read):
+            fill_pattern(buf, int(rel), int(to_read), skip_filler)
             cur += to_read
             continue
-        try:
-            chunk = src.read_at(cur, to_read)
-            if chunk:
-                buf[rel : rel + len(chunk)] = chunk
+
+        last_err: Optional[OSError] = None
+        ok = False
+        attempt = 0
+        while attempt <= retries:
+            try:
+                chunk = src.read_at(cur, to_read)
+                if chunk:
+                    buf[rel : rel + len(chunk)] = chunk
                 if len(chunk) < to_read:
-                    # keep zeros for remainder
+                    # keep remainder filled (zeros/pattern)
                     pass
-            state.register_success()
-        except OSError as e:
-            maybe_panic(e)
-            state.register_error(cur, to_read)
+                state.register_success()
+                ok = True
+                break
+            except OSError as e:
+                last_err = e
+                maybe_panic(e)
+                state.register_error(cur, to_read)
+            attempt += 1
+
+        if not ok:
+            fill_pattern(buf, int(rel), int(to_read), bad_filler)
             if log_cb:
-                log_cb("bad_sector", f"I/O error @{cur} (+{to_read}): {e}; zero-filled")
+                log_cb(
+                    "bad_sector",
+                    f"I/O error @{cur} (+{to_read}) retries={retries}: {last_err}; filled",
+                )
+
+            if deviojump_sectors > 0:
+                jump_bytes = deviojump_sectors * sec
+                # Fill the skipped area (best-effort) and advance.
+                remaining = end - (cur + to_read)
+                to_skip = min(jump_bytes, max(0, remaining))
+                if to_skip > 0:
+                    rel2 = (cur + to_read) - offset
+                    fill_pattern(buf, int(rel2), int(to_skip), skip_filler)
+                    cur += to_read + to_skip
+                    continue
+
         cur += to_read
 
     return bytes(buf)

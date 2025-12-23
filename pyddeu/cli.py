@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .io import list_sources, open_source
 from .partitions import scan_partitions
-from .state import RecoveryState
+from .state import RecoveryState, map_path_for_source
 
 
 def _cmd_list_disks(_args: argparse.Namespace) -> int:
@@ -19,7 +19,7 @@ def _cmd_list_disks(_args: argparse.Namespace) -> int:
 def _cmd_scan(args: argparse.Namespace) -> int:
     src = open_source(args.source)
     try:
-        state = RecoveryState(map_path=Path("pyddeu.map.json"))
+        state = RecoveryState(map_path=map_path_for_source(args.source))
 
         def log_cb(level: str, msg: str) -> None:
             print(f"[{level}] {msg}")

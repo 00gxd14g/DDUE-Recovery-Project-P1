@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from .config import PyddeuConfig
 
 @dataclass(frozen=True)
 class Region:
@@ -57,16 +60,36 @@ class BadRegionMap:
             self._regions = self._merge_all(self._regions)
 
     def contains(self, offset: int, size: int) -> bool:
+        """
+        Returns True only when the *entire* [offset, offset+size) range is known bad.
+
+        This is intentionally a full-containment check (not an overlap check).
+        Otherwise, tiny probe failures (e.g. 4 bytes) can incorrectly poison large
+        reads and make partition/NTFS carving appear "stuck".
+        """
         if size <= 0:
             return False
-        query = Region(offset, offset + size)
+        start = int(offset)
+        end = start + int(size)
         with self._lock:
-            for region in self._regions:
-                if region.start >= query.end:
-                    return False
-                if region.overlaps(query):
-                    return True
-        return False
+            regions = self._regions
+            if not regions:
+                return False
+            # Binary search for the rightmost region whose start <= query start.
+            lo = 0
+            hi = len(regions) - 1
+            idx = -1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if regions[mid].start <= start:
+                    idx = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if idx < 0:
+                return False
+            region = regions[idx]
+            return region.start <= start and region.end >= end
 
     @staticmethod
     def _merge_all(regions: Iterable[Region]) -> list[Region]:
@@ -87,6 +110,29 @@ class BadRegionMap:
             return len(self._regions)
 
 
+_MAP_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def map_path_for_source(source_path: str, *, directory: Path | None = None) -> Path:
+    """
+    Returns a stable, filesystem-safe per-source bad-region map path.
+
+    This avoids a single global map file poisoning scans across different disks/images.
+    """
+    raw = (source_path or "").strip()
+    if raw.startswith("\\\\.\\"):
+        base = raw[4:]
+    else:
+        try:
+            base = Path(raw).name
+        except Exception:
+            base = raw
+    base = _MAP_NAME_SAFE_RE.sub("_", base or "source").strip("_") or "source"
+    digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:10] if raw else "unknown"
+    root = directory or Path(".")
+    return root / f"pyddeu.map.{base}.{digest}.json"
+
+
 LogCb = Callable[[str, str], None]
 
 
@@ -96,9 +142,11 @@ class RecoveryState:
         map_path: Path,
         block_size: int = 4096,
         max_skip_size: int = 1024 * 1024 * 100,
+        config: Optional[PyddeuConfig] = None,
     ):
         self.block_size = int(block_size)
         self.max_skip_size = int(max_skip_size)
+        self.config = config or PyddeuConfig()
 
         self.bad_map = BadRegionMap(map_path)
         self.skip_size = self.block_size
@@ -111,6 +159,22 @@ class RecoveryState:
 
         self._lock = threading.Lock()
         self._dirty_counter = 0
+
+    def reset(self, *, map_path: Optional[Path] = None) -> None:
+        """
+        Resets adaptive read state and (optionally) swaps the bad-region map.
+
+        Keeps object identity stable so background monitor threads can keep
+        referencing the same RecoveryState instance.
+        """
+        with self._lock:
+            if map_path is not None:
+                self.bad_map = BadRegionMap(map_path)
+            self.skip_size = self.block_size
+            self.consecutive_errors = 0
+            self.pause_until = 0.0
+            self._panic_level = 0
+            self._dirty_counter = 0
 
     def register_error(self, offset: int, size: int) -> None:
         with self._lock:
@@ -137,7 +201,8 @@ class RecoveryState:
         """
         with self._lock:
             self._panic_level = min(self._panic_level + 1, 10)
-            pause_s = min(60.0, 2.0 * (1.5 ** self._panic_level))
+            # Be aggressive: long pauses can make UI-based carving look "stuck".
+            pause_s = min(10.0, 1.0 * (1.5 ** self._panic_level))
             self.pause_until = max(self.pause_until, time.time() + pause_s)
         if log_cb:
             try:
@@ -155,4 +220,6 @@ class RecoveryState:
         now = time.time()
         until = self.pause_until
         if until > now:
-            time.sleep(max(0.01, until - now))
+            # Sleep in short chunks so stop/pause state stays responsive.
+            remaining = until - now
+            time.sleep(max(0.05, min(0.25, remaining)))

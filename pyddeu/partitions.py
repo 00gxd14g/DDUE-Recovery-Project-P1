@@ -10,9 +10,11 @@ from .io import open_source
 from .ntfs_boot import parse_ntfs_boot_sector
 from .scan import safe_read_granular
 from .state import RecoveryState
+from .config import PyddeuConfig
 
 
 DEFAULT_SECTOR_SIZE = 512
+_MBR_SIG = b"\x55\xAA"
 
 
 @dataclass(frozen=True)
@@ -30,7 +32,47 @@ class Partition:
 
 
 def _is_mbr(boot: bytes) -> bool:
-    return len(boot) >= 512 and boot[510:512] == b"\x55\xAA"
+    return len(boot) >= 512 and boot[510:512] == _MBR_SIG
+
+
+def _is_exfat_boot(buf: bytes) -> bool:
+    # exFAT: jump(3) + OEMName "EXFAT   " at offset 3, signature 0x55AA.
+    return len(buf) >= 512 and buf[3:11] == b"EXFAT   " and buf[510:512] == _MBR_SIG
+
+
+def _parse_exfat_size(buf: bytes) -> Optional[int]:
+    # VolumeLength is in sectors; BytesPerSectorPow is 2^n.
+    try:
+        vol_len_sectors = int(struct.unpack_from("<Q", buf, 0x48)[0])
+        bps_pow = int(buf[0x6C])
+        bps = 1 << bps_pow
+        if bps < 512 or bps > 4096:
+            return None
+        if vol_len_sectors <= 0:
+            return None
+        return vol_len_sectors * bps
+    except Exception:
+        return None
+
+
+def _is_fat32_boot(buf: bytes) -> bool:
+    # FAT32: "FAT32   " at offset 0x52 (82), signature 0x55AA.
+    return len(buf) >= 512 and buf[0x52:0x5A] == b"FAT32   " and buf[510:512] == _MBR_SIG
+
+
+def _parse_fat32_size(buf: bytes) -> Optional[int]:
+    try:
+        bps = int(struct.unpack_from("<H", buf, 0x0B)[0])
+        if bps < 512 or bps > 4096:
+            return None
+        tot16 = int(struct.unpack_from("<H", buf, 0x13)[0])
+        tot32 = int(struct.unpack_from("<I", buf, 0x20)[0])
+        total_sectors = tot32 if tot32 else tot16
+        if total_sectors <= 0:
+            return None
+        return total_sectors * bps
+    except Exception:
+        return None
 
 
 def _parse_mbr(boot: bytes) -> list[Partition]:
@@ -47,6 +89,8 @@ def _parse_mbr(boot: bytes) -> list[Partition]:
         type_str = f"MBR 0x{p_type:02X}"
         if p_type in (0x07,):
             type_str += " (NTFS/exFAT)"
+        elif p_type in (0x0B, 0x0C):
+            type_str += " (FAT32)"
         elif p_type in (0x83,):
             type_str += " (Linux)"
         elif p_type == 0xEE:
@@ -181,6 +225,7 @@ def carve_ntfs_partitions(
     log_cb: Optional[Callable[[str, str], None]] = None,
     progress_cb: Optional[Callable[[int, int, int], None]] = None,
     source_path: Optional[str] = None,
+    config: PyddeuConfig | None = None,
 ) -> list[Partition]:
     """
     Read-only scan that looks for NTFS boot sectors when the partition table is missing/corrupt.
@@ -206,7 +251,7 @@ def carve_ntfs_partitions(
 
     if source_path:
         try:
-            cur_src = open_source(source_path)
+            cur_src = open_source(source_path, config=config)
             owns_src = True
         except Exception:
             cur_src = src
@@ -224,7 +269,7 @@ def carve_ntfs_partitions(
                     return False
             return False
         try:
-            new_src = open_source(source_path)
+            new_src = open_source(source_path, config=config)
         except Exception:
             return False
         try:
@@ -352,6 +397,312 @@ def carve_ntfs_partitions(
                         if 0 <= cand < size:
                             try_ntfs_at(cand)
                     start = pos + 1
+
+            step = base_len
+            if state:
+                step = max(step, int(getattr(state, "skip_size", 0) or 0))
+            offset += step
+    finally:
+        if owns_src:
+            try:
+                cur_src.close()
+            except Exception:
+                pass
+
+    return hits
+
+
+def carve_exfat_partitions(
+    src: DiskSource,
+    *,
+    state: Optional[RecoveryState] = None,
+    log_cb: Optional[Callable[[str, str], None]] = None,
+    progress_cb: Optional[Callable[[int, int, int], None]] = None,
+    min_chunk: int = 4 * 1024 * 1024,
+    max_chunk: int = 128 * 1024 * 1024,
+    max_hits: int = 64,
+    source_path: str = "",
+    config: PyddeuConfig | None = None,
+) -> list[Partition]:
+    """
+    Read-only scan to locate exFAT boot sectors when partition tables are missing/corrupt.
+    Looks for OEMName "EXFAT   " and validates the 0x55AA signature.
+    """
+    size = int(src.size() or 0)
+    if size <= 0:
+        return []
+
+    sector_size = src.sector_size() or DEFAULT_SECTOR_SIZE
+    offset = 0
+    idx = 1
+    hits: list[Partition] = []
+    seen_offsets: set[int] = set()
+
+    cur_src = src
+    owns_src = False
+
+    def reopen_source() -> bool:
+        nonlocal cur_src, owns_src
+        if not source_path:
+            return False
+        try:
+            new_src = open_source(source_path, config=config)
+        except Exception:
+            return False
+        try:
+            if owns_src:
+                cur_src.close()
+        except Exception:
+            pass
+        cur_src = new_src
+        owns_src = True
+        return True
+
+    def read_chunk(off: int, size_bytes: int) -> tuple[bytes, bool]:
+        nonlocal cur_src
+        if state:
+            state.wait_if_paused()
+            if state.stop_requested or not state.is_alive:
+                return b"", False
+            if state.bad_map.contains(off, size_bytes):
+                return b"", True
+        for attempt in range(2):
+            try:
+                data = cur_src.read_at(off, size_bytes)
+                if len(data) < size_bytes:
+                    data += b"\x00" * (size_bytes - len(data))
+                return data, False
+            except OSError as e:
+                if log_cb:
+                    log_cb("CRITICAL", f"Carve chunk read failed @{off} (+{size_bytes}) attempt {attempt + 1}: {e}")
+                if attempt == 0 and reopen_source():
+                    continue
+                return b"", True
+        return b"", True
+
+    def try_exfat_at(off: int) -> None:
+        nonlocal idx
+        if off in seen_offsets:
+            return
+        seen_offsets.add(off)
+        boot = safe_read_granular(cur_src, state or _NULL_STATE, off, sector_size, log_cb=log_cb)
+        if len(boot) < 512 or not _is_exfat_boot(boot[:512]):
+            return
+        length = _parse_exfat_size(boot[:512])
+        if not length:
+            return
+        hits.append(
+            Partition(
+                index=idx,
+                start_offset=off,
+                length=int(length),
+                scheme="CARVE",
+                type_str="exFAT (carved boot sector)",
+                name="",
+            )
+        )
+        idx += 1
+
+    current_chunk = min_chunk
+    success_streak = 0
+    overlap = 4096
+    last_log = 0
+    try:
+        while offset < size and len(hits) < max_hits:
+            if state and (state.stop_requested or not state.is_alive):
+                break
+            if progress_cb:
+                try:
+                    progress_cb(offset, size, len(hits))
+                except Exception:
+                    pass
+            if log_cb and offset - last_log >= 256 * 1024 * 1024:
+                log_cb("INFO", f"exFAT carve progress: offset={offset} hits={len(hits)}")
+                last_log = offset
+
+            base_len = min(current_chunk, size - offset)
+            if base_len <= 0:
+                break
+            read_len = min(base_len + overlap, size - offset)
+            buf, had_error = read_chunk(offset, read_len)
+            if had_error or not buf:
+                if state:
+                    state.register_error(offset, max(1, base_len))
+                success_streak = 0
+                current_chunk = max(min_chunk, current_chunk // 2)
+                step = base_len
+                if state:
+                    step = max(step, int(getattr(state, "skip_size", 0) or 0))
+                offset += step
+                continue
+
+            success_streak += 1
+            if success_streak >= 4 and current_chunk < max_chunk:
+                current_chunk = min(max_chunk, current_chunk * 2)
+                success_streak = 0
+
+            start = 0
+            while True:
+                pos = buf.find(b"EXFAT   ", start)
+                if pos == -1:
+                    break
+                cand = offset + pos - 3
+                if 0 <= cand < size:
+                    try_exfat_at(cand)
+                start = pos + 1
+
+            step = base_len
+            if state:
+                step = max(step, int(getattr(state, "skip_size", 0) or 0))
+            offset += step
+    finally:
+        if owns_src:
+            try:
+                cur_src.close()
+            except Exception:
+                pass
+
+    return hits
+
+
+def carve_fat32_partitions(
+    src: DiskSource,
+    *,
+    state: Optional[RecoveryState] = None,
+    log_cb: Optional[Callable[[str, str], None]] = None,
+    progress_cb: Optional[Callable[[int, int, int], None]] = None,
+    min_chunk: int = 4 * 1024 * 1024,
+    max_chunk: int = 128 * 1024 * 1024,
+    max_hits: int = 64,
+    source_path: str = "",
+    config: PyddeuConfig | None = None,
+) -> list[Partition]:
+    """
+    Read-only scan to locate FAT32 boot sectors when partition tables are missing/corrupt.
+    Looks for "FAT32   " marker (offset 0x52) and validates the 0x55AA signature.
+    """
+    size = int(src.size() or 0)
+    if size <= 0:
+        return []
+
+    sector_size = src.sector_size() or DEFAULT_SECTOR_SIZE
+    offset = 0
+    idx = 1
+    hits: list[Partition] = []
+    seen_offsets: set[int] = set()
+
+    cur_src = src
+    owns_src = False
+
+    def reopen_source() -> bool:
+        nonlocal cur_src, owns_src
+        if not source_path:
+            return False
+        try:
+            new_src = open_source(source_path, config=config)
+        except Exception:
+            return False
+        try:
+            if owns_src:
+                cur_src.close()
+        except Exception:
+            pass
+        cur_src = new_src
+        owns_src = True
+        return True
+
+    def read_chunk(off: int, size_bytes: int) -> tuple[bytes, bool]:
+        nonlocal cur_src
+        if state:
+            state.wait_if_paused()
+            if state.stop_requested or not state.is_alive:
+                return b"", False
+            if state.bad_map.contains(off, size_bytes):
+                return b"", True
+        for attempt in range(2):
+            try:
+                data = cur_src.read_at(off, size_bytes)
+                if len(data) < size_bytes:
+                    data += b"\x00" * (size_bytes - len(data))
+                return data, False
+            except OSError as e:
+                if log_cb:
+                    log_cb("CRITICAL", f"Carve chunk read failed @{off} (+{size_bytes}) attempt {attempt + 1}: {e}")
+                if attempt == 0 and reopen_source():
+                    continue
+                return b"", True
+        return b"", True
+
+    def try_fat32_at(off: int) -> None:
+        nonlocal idx
+        if off in seen_offsets:
+            return
+        seen_offsets.add(off)
+        boot = safe_read_granular(cur_src, state or _NULL_STATE, off, sector_size, log_cb=log_cb)
+        if len(boot) < 512 or not _is_fat32_boot(boot[:512]):
+            return
+        length = _parse_fat32_size(boot[:512])
+        if not length:
+            return
+        hits.append(
+            Partition(
+                index=idx,
+                start_offset=off,
+                length=int(length),
+                scheme="CARVE",
+                type_str="FAT32 (carved boot sector)",
+                name="",
+            )
+        )
+        idx += 1
+
+    current_chunk = min_chunk
+    success_streak = 0
+    overlap = 4096
+    last_log = 0
+    try:
+        while offset < size and len(hits) < max_hits:
+            if state and (state.stop_requested or not state.is_alive):
+                break
+            if progress_cb:
+                try:
+                    progress_cb(offset, size, len(hits))
+                except Exception:
+                    pass
+            if log_cb and offset - last_log >= 256 * 1024 * 1024:
+                log_cb("INFO", f"FAT32 carve progress: offset={offset} hits={len(hits)}")
+                last_log = offset
+
+            base_len = min(current_chunk, size - offset)
+            if base_len <= 0:
+                break
+            read_len = min(base_len + overlap, size - offset)
+            buf, had_error = read_chunk(offset, read_len)
+            if had_error or not buf:
+                if state:
+                    state.register_error(offset, max(1, base_len))
+                success_streak = 0
+                current_chunk = max(min_chunk, current_chunk // 2)
+                step = base_len
+                if state:
+                    step = max(step, int(getattr(state, "skip_size", 0) or 0))
+                offset += step
+                continue
+
+            success_streak += 1
+            if success_streak >= 4 and current_chunk < max_chunk:
+                current_chunk = min(max_chunk, current_chunk * 2)
+                success_streak = 0
+
+            start = 0
+            while True:
+                pos = buf.find(b"FAT32   ", start)
+                if pos == -1:
+                    break
+                cand = offset + pos - 0x52
+                if 0 <= cand < size:
+                    try_fat32_at(cand)
+                start = pos + 1
 
             step = base_len
             if state:

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import threading
 
 from .base import DiskSource, SourceInfo
+from ..config import PyddeuConfig
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -47,6 +48,9 @@ class DISK_GEOMETRY_EX(ctypes.Structure):
 
 IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+ERROR_IO_PENDING = 997
+WAIT_OBJECT_0 = 0x00000000
+WAIT_TIMEOUT = 0x00000102
 
 # --- Kernel32 Tanımları ---
 kernel32.CreateFileW.argtypes = [
@@ -63,6 +67,9 @@ kernel32.CreateFileW.restype = wintypes.HANDLE
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 
+kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.CreateEventW.restype = wintypes.HANDLE
+
 kernel32.ReadFile.argtypes = [
     wintypes.HANDLE,
     wintypes.LPVOID,
@@ -71,6 +78,20 @@ kernel32.ReadFile.argtypes = [
     wintypes.LPVOID,
 ]
 kernel32.ReadFile.restype = wintypes.BOOL
+
+kernel32.GetOverlappedResult.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.BOOL,
+]
+kernel32.GetOverlappedResult.restype = wintypes.BOOL
+
+kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+kernel32.CancelIoEx.restype = wintypes.BOOL
+
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
 
 kernel32.SetFilePointerEx.argtypes = [
     wintypes.HANDLE,
@@ -94,6 +115,66 @@ kernel32.DeviceIoControl.restype = wintypes.BOOL
 
 kernel32.GetFileSizeEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_longlong)]
 kernel32.GetFileSizeEx.restype = wintypes.BOOL
+
+
+class OVERLAPPED(ctypes.Structure):
+    _fields_ = [
+        ("Internal", wintypes.ULONG_PTR),
+        ("InternalHigh", wintypes.ULONG_PTR),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
+
+def _read_overlapped_timeout(handle: int, offset: int, size: int, timeout_ms: int) -> bytes:
+    if size <= 0:
+        return b""
+    if timeout_ms <= 0:
+        timeout_ms = 1
+
+    evt = kernel32.CreateEventW(None, True, False, None)
+    if evt == 0:
+        _raise_last_error("CreateEventW failed")
+
+    try:
+        ov = OVERLAPPED()
+        ov.Offset = wintypes.DWORD(offset & 0xFFFFFFFF)
+        ov.OffsetHigh = wintypes.DWORD((offset >> 32) & 0xFFFFFFFF)
+        ov.hEvent = evt
+
+        buf = ctypes.create_string_buffer(int(size))
+        read_bytes = wintypes.DWORD(0)
+
+        ok = kernel32.ReadFile(handle, buf, int(size), ctypes.byref(read_bytes), ctypes.byref(ov))
+        if not ok:
+            err = ctypes.get_last_error()
+            if err != ERROR_IO_PENDING:
+                raise OSError(err, f"ReadFile failed @ {offset} (winerr={err})")
+
+            wait = kernel32.WaitForSingleObject(evt, int(timeout_ms))
+            if wait == WAIT_TIMEOUT:
+                try:
+                    kernel32.CancelIoEx(handle, ctypes.byref(ov))
+                except Exception:
+                    pass
+                raise OSError(1460, f"ReadFile timeout @ {offset} (+{size}) (winerr=1460)")
+            if wait != WAIT_OBJECT_0:
+                raise OSError(int(wait), f"WaitForSingleObject failed @ {offset} (code={wait})")
+
+            ok2 = kernel32.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(read_bytes), False)
+            if not ok2:
+                _raise_last_error(f"GetOverlappedResult failed @ {offset}")
+
+        actual = int(read_bytes.value)
+        if actual <= 0:
+            return b""
+        return buf.raw[:actual]
+    finally:
+        try:
+            kernel32.CloseHandle(evt)
+        except Exception:
+            pass
 
 
 def _raise_last_error(prefix: str) -> None:
@@ -149,6 +230,7 @@ class WindowsSyncSource(DiskSource):
     _handle: int
     _size: int
     _sector_size: int
+    _overlapped_timeout_ms: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def size(self) -> int:
@@ -185,6 +267,71 @@ class WindowsSyncSource(DiskSource):
             self._size = _query_size(handle)
             self._sector_size = _query_sector_size(handle)
 
+    def refresh_with_timeout(self, timeout_s: float = 5.0) -> bool:
+        """
+        Attempts a best-effort refresh but returns if it takes too long.
+
+        Note: During controller resets, Windows storage APIs may block. This runs
+        the open/query work in a helper thread and only swaps handles if it finishes.
+        """
+        timeout_s = float(timeout_s)
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def worker() -> None:
+            try:
+                handle = kernel32.CreateFileW(
+                    self.path,
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    None,
+                )
+                if handle == INVALID_HANDLE_VALUE:
+                    _raise_last_error(f"CreateFileW failed for {self.path!r}")
+                try:
+                    size = _query_size(handle)
+                    sector_size = _query_sector_size(handle)
+                    result["handle"] = int(handle)
+                    result["size"] = int(size)
+                    result["sector_size"] = int(sector_size)
+                except Exception:
+                    try:
+                        kernel32.CloseHandle(handle)
+                    except Exception:
+                        pass
+                    raise
+            except Exception as e:
+                result["error"] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+        if not done.wait(timeout=max(0.1, timeout_s)):
+            return False
+
+        err = result.get("error")
+        if err is not None:
+            raise err  # type: ignore[misc]
+
+        new_handle = int(result["handle"])  # type: ignore[arg-type]
+        new_size = int(result.get("size", 0) or 0)
+        new_sector_size = int(result.get("sector_size", 512) or 512)
+
+        with self._lock:
+            old = self._handle
+            self._handle = new_handle
+            self._size = new_size
+            self._sector_size = new_sector_size
+            try:
+                if old != INVALID_HANDLE_VALUE:
+                    kernel32.CloseHandle(old)
+            except Exception:
+                pass
+        return True
+
     def read_at(self, offset: int, size: int) -> bytes:
         """
         Senkron ve Sektör Hizalı Okuma (Synchronous Aligned Read).
@@ -217,6 +364,25 @@ class WindowsSyncSource(DiskSource):
 
             if aligned_read_len <= 0:
                 return b""
+
+            # Timeout'lu overlapped okuma: controller reset aninda bloklanmayi azaltir.
+            if int(self._overlapped_timeout_ms or 0) > 0:
+                try:
+                    available_data = _read_overlapped_timeout(
+                        int(self._handle),
+                        int(aligned_start),
+                        int(aligned_read_len),
+                        int(self._overlapped_timeout_ms),
+                    )
+                    if not available_data:
+                        return b""
+                    data_start = offset - aligned_start
+                    data_end = data_start + size
+                    if data_start >= len(available_data):
+                        return b""
+                    return available_data[data_start:data_end]
+                except OSError:
+                    pass
 
             # ReadFile DWORD size sınırı
             max_dword = 0xFFFFFFFF
@@ -259,7 +425,7 @@ class WindowsSyncSource(DiskSource):
                 self._handle = INVALID_HANDLE_VALUE
 
 
-def open_windows_source(path: str) -> DiskSource:
+def open_windows_source(path: str, *, config: PyddeuConfig | None = None) -> DiskSource:
     # FILE_FLAG_OVERLAPPED yok -> Senkron Mod (Daha güvenli)
     handle = kernel32.CreateFileW(
         path,
@@ -277,7 +443,15 @@ def open_windows_source(path: str) -> DiskSource:
     size = _query_size(handle)
     sector_size = _query_sector_size(handle)
 
-    return WindowsSyncSource(path=path, _handle=handle, _size=size, _sector_size=sector_size)
+    cfg = config or PyddeuConfig()
+    # dmde.ini: deviowait=0 disables overlapped; deviowait>0 is cancel timeout (ms).
+    return WindowsSyncSource(
+        path=path,
+        _handle=handle,
+        _size=size,
+        _sector_size=sector_size,
+        _overlapped_timeout_ms=int(getattr(cfg, "deviowait_ms", 0) or 0),
+    )
 
 
 def list_physical_drives(max_index: int = 32) -> list[SourceInfo]:

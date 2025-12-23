@@ -23,7 +23,7 @@ python -m pyddeu scan --source <path>
 
 ## DMDE-like read-only scans (GUI)
 
-- `Scan Partitions`: MBR/GPT parse; if missing/corrupt, falls back to read-only NTFS boot-sector carving.
+- `Scan Partitions`: MBR/GPT parse; if missing/corrupt, falls back to read-only boot-sector carving (NTFS/exFAT/FAT32).
 - `MFT Scan (RAW)`: scans the whole device/image for `FILE` MFT record signatures and lists best-effort results (including deleted) + can save resident data.
 - `File Carve (RAW)`: signature-based carving (JPEG/PDF/ZIP) into a chosen output folder.
 - `Deep Scan (NTFS)`: scans the selected NTFS partition, parses MFT records, rebuilds paths via Parent Directory refs, and enables recovery of resident + non-resident `$DATA` using decoded runlists (best-effort).

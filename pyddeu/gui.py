@@ -20,9 +20,15 @@ else:
 
 from .io import list_sources, open_source
 from .mft import build_paths, scan_and_parse_mft
-from .partitions import Partition, carve_ntfs_partitions, scan_partitions
+from .partitions import (
+    Partition,
+    carve_exfat_partitions,
+    carve_fat32_partitions,
+    carve_ntfs_partitions,
+    scan_partitions,
+)
 from .platform import IS_WINDOWS, format_source_hint, is_admin
-from .state import RecoveryState
+from .state import RecoveryState, map_path_for_source
 from .tskimg import DDEUImg
 from .carve import carve_signatures
 from .monitor import start_monitor
@@ -30,6 +36,7 @@ from .ntfs_boot import parse_ntfs_boot_sector
 from .recover import recover_nonresident_runs
 from .imager import create_image
 from .exporter import RobustExporter
+from .config import PyddeuConfig, default_config_path
 
 
 @dataclass(frozen=True)
@@ -49,7 +56,7 @@ class _TreeItem:
 class PyDDEUGui:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("PyDDEU - Forensic Recovery (NTFS)")
+        self.root.title("PyDDEU - Forensic Recovery")
         self.root.geometry("1280x850")
 
         self.log_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
@@ -62,13 +69,15 @@ class PyDDEUGui:
         self._refresh_inflight = False
         self._last_refresh_ts = 0.0
 
-        self.state = RecoveryState(map_path=Path("pyddeu.map.json"))
+        self.config = PyddeuConfig.load(default_config_path())
+        self.state = RecoveryState(map_path=map_path_for_source("unselected"), config=self.config)
         self.partitions: list[Partition] = []
         self.node_metadata: dict[str, tuple[int, int, bool]] = {}
         self._resident_cache: dict[str, bytes] = {}
         self._nonresident_cache: dict[str, tuple[int, int, list[tuple[int | None, int]], int | None]] = {}
 
         self._setup_ui()
+        self._log("INFO", f"Config loaded: {default_config_path()} (retries={self.config.retries}, jump={self.config.deviojump_sectors}, overlapped_ms={self.config.deviowait_ms})")
         self._log_file = None
         try:
             self._log_file = open("pyddeu_debug.log", "a", encoding="utf-8", buffering=1)
@@ -158,7 +167,7 @@ class PyDDEUGui:
         self.txt_hex = tk.Text(left_frame, bg="#101010", fg="#00FF00", font=("Courier New", 9))
         left_frame.add(self.txt_hex, text="Hex/ASCII")
 
-        right_frame = ttk.LabelFrame(paned, text="File Tree (pytsk3 / NTFS)")
+        right_frame = ttk.LabelFrame(paned, text="File Tree (pytsk3)")
         paned.add(right_frame, weight=3)
 
         cols = ("size", "status", "inode")
@@ -267,7 +276,14 @@ class PyDDEUGui:
         def worker() -> None:
             try:
                 self._log("WARNING", f"Refreshing disk handle (reason: {reason})")
-                refresh()
+                refresh2 = getattr(src, "refresh_with_timeout", None)
+                if callable(refresh2):
+                    ok = bool(refresh2(5.0))
+                    if not ok:
+                        self._log("WARNING", "Disk handle refresh timed out; will retry on next reset.")
+                        return
+                else:
+                    refresh()
                 self._log("INFO", "Disk handle refreshed.")
             except Exception as e:
                 self._log("WARNING", f"Disk handle refresh failed: {e}")
@@ -294,23 +310,60 @@ class PyDDEUGui:
                 self.state.wait_if_paused()
                 parts = scan_partitions(self.source, state=self.state, log_cb=self._log)
                 if not parts:
-                    self._log("WARNING", "No MBR/GPT partitions found. Trying optimized NTFS boot carve.")
+                    self._log(
+                        "WARNING",
+                        "No MBR/GPT partitions found. Trying optimized boot-sector carving (NTFS/exFAT/FAT32).",
+                    )
                     total = self.source.size() or 0
 
                     def prog(off: int, total_size: int, hits: int) -> None:
                         if total_size > 0:
                             self._status_pct = int(min(99, (off / total_size) * 100))
-                        self._status_text = f"Carving NTFS boots. hits={hits}"
+                        self._status_text = f"Carving boot sectors… hits={hits}"
 
-                    parts = carve_ntfs_partitions(
-                        self.source,
-                        state=self.state,
-                        log_cb=self._log,
-                        progress_cb=prog,
-                        source_path=self.source_path,
+                    carved: list[Partition] = []
+                    carved.extend(
+                        carve_ntfs_partitions(
+                            self.source,
+                            state=self.state,
+                            log_cb=self._log,
+                            progress_cb=prog,
+                            source_path=self.source_path,
+                            config=self.config,
+                        )
                     )
+                    carved.extend(
+                        carve_exfat_partitions(
+                            self.source,
+                            state=self.state,
+                            log_cb=self._log,
+                            progress_cb=prog,
+                            source_path=self.source_path,
+                            config=self.config,
+                        )
+                    )
+                    carved.extend(
+                        carve_fat32_partitions(
+                            self.source,
+                            state=self.state,
+                            log_cb=self._log,
+                            progress_cb=prog,
+                            source_path=self.source_path,
+                            config=self.config,
+                        )
+                    )
+
+                    parts = carved
+                    if parts:
+                        dedup: dict[int, Partition] = {}
+                        for p in parts:
+                            dedup.setdefault(int(p.start_offset), p)
+                        parts = sorted(dedup.values(), key=lambda p: p.start_offset)
                     if not parts:
-                        self._log("WARNING", "No carved NTFS boot sectors found. Falling back to RAW carve.")
+                        self._log(
+                            "WARNING",
+                            "No carved NTFS/exFAT/FAT32 boot sectors found. Falling back to RAW carve.",
+                        )
                         self._run_raw_carve(label="Smart Recovery")
                         return
 
@@ -325,10 +378,18 @@ class PyDDEUGui:
                     self._run_raw_carve(label="Smart Recovery")
                     return
 
-                found = self._run_deep_ntfs_scan(picked, label="Smart Recovery")
-                if found <= 0:
-                    self._log("WARNING", "Deep scan returned no records. Falling back to RAW carve.")
-                    self._run_raw_carve(label="Smart Recovery")
+                t = str(picked.type_str or "").upper()
+                if "NTFS" in t:
+                    found = self._run_deep_ntfs_scan(picked, label="Smart Recovery")
+                    if found <= 0:
+                        self._log("WARNING", "Deep scan returned no records. Trying filesystem parse via pytsk3.")
+                        if not self._run_parse_fs(picked, label="Smart Recovery"):
+                            self._log("WARNING", "Filesystem parse failed. Falling back to RAW carve.")
+                            self._run_raw_carve(label="Smart Recovery")
+                else:
+                    if not self._run_parse_fs(picked, label="Smart Recovery"):
+                        self._log("WARNING", "Filesystem parse failed. Falling back to RAW carve.")
+                        self._run_raw_carve(label="Smart Recovery")
             except Exception as e:
                 self._log("CRITICAL", f"Smart recovery failed: {e}")
                 self._status_text = "Smart recovery failed"
@@ -346,6 +407,46 @@ class PyDDEUGui:
             return (is_ntfs, int(p.length))
 
         return max(parts, key=score)
+
+    def _run_parse_fs(self, part: Partition, *, label: str = "") -> bool:
+        if pytsk3 is None:
+            self._log("CRITICAL", f"pytsk3 is not available: {_PYTSK3_IMPORT_ERROR}")
+            return False
+
+        self.state.stop_requested = False
+        self.tree.delete(*self.tree.get_children())
+        self.node_metadata = {}
+        self._resident_cache = {}
+        self._nonresident_cache = {}
+
+        def log_cb(level: str, msg: str) -> None:
+            self._log(level, msg)
+
+        src = None
+        try:
+            prefix = f"{label} - " if label else ""
+            self._status_text = f"{prefix}Parsing filesystem via pytsk3…"
+            self._status_pct = None
+            src = open_source(self.source_path, config=self.config)
+            img = DDEUImg(src, self.state, log_cb=log_cb)
+            fs = pytsk3.FS_Info(img, offset=int(part.start_offset))
+            root_dir = fs.open_dir(path="/")
+            self._walk_dir(root_dir, "", int(part.start_offset))
+            self._log("INFO", f"{prefix}Filesystem parse completed.")
+            self._status_text = "Filesystem parse done"
+            self._status_pct = 100
+            return True
+        except Exception as e:
+            self._log("CRITICAL", f"Filesystem parse failed: {e}")
+            self._status_text = "Filesystem parse failed"
+            self._status_pct = None
+            return False
+        finally:
+            try:
+                if src:
+                    src.close()
+            except Exception:
+                pass
 
     def _run_raw_carve(self, *, label: str = "") -> int:
         try:
@@ -366,7 +467,7 @@ class PyDDEUGui:
         found = 0
         src = None
         try:
-            src = open_source(self.source_path)
+            src = open_source(self.source_path, config=self.config)
             prefix = f"{label} - " if label else ""
             self._log("INFO", f"{prefix}Starting RAW file carving to: {out_dir}")
             self._status_text = "RAW file carve."
@@ -556,10 +657,13 @@ class PyDDEUGui:
             pass
 
         try:
-            self.source = open_source(path)
+            self.source = open_source(path, config=self.config)
             self.source_path = path
             size_gb = (self.source.size() or 0) / (1024**3)
             self._log("INFO", f"Connected: {path} ({size_gb:.2f} GB)")
+            map_path = map_path_for_source(path)
+            self.state.reset(map_path=map_path)
+            self._log("INFO", f"Bad-region map: {map_path}")
             if self._monitor_thread is None:
                 self._monitor_thread = start_monitor(self._log, self.source_path, state=self.state)
             # refresh output root from entry
@@ -669,20 +773,20 @@ class PyDDEUGui:
 
         def worker() -> None:
             try:
-                self._status_text = "Parsing NTFS via pytsk3…"
+                self._status_text = "Parsing filesystem via pytsk3…"
                 self._status_pct = None
-                src = open_source(self.source_path)
+                src = open_source(self.source_path, config=self.config)
                 img = DDEUImg(src, self.state, log_cb=log_cb)
                 fs = pytsk3.FS_Info(img, offset=part.start_offset)
                 root_dir = fs.open_dir(path="/")
                 self._walk_dir(root_dir, "", part.start_offset)
                 src.close()
-                self._log("INFO", "NTFS parse completed.")
-                self._status_text = "NTFS parse done"
+                self._log("INFO", "Filesystem parse completed.")
+                self._status_text = "Filesystem parse done"
                 self._status_pct = 100
             except Exception as e:
-                self._log("CRITICAL", f"NTFS parse failed: {e}")
-                self._status_text = "NTFS parse failed"
+                self._log("CRITICAL", f"Filesystem parse failed: {e}")
+                self._status_text = "Filesystem parse failed"
                 self._status_pct = None
 
         threading.Thread(target=worker, daemon=True).start()
@@ -719,7 +823,7 @@ class PyDDEUGui:
             prefix = f"{label} - " if label else ""
             self._status_text = f"{prefix}Deep NTFS scan (MFT)..."
             self._status_pct = 0
-            src = open_source(self.source_path)
+            src = open_source(self.source_path, config=self.config)
             boot_buf = src.read_at(part.start_offset, 512)
             boot = parse_ntfs_boot_sector(boot_buf)
             if not boot:
@@ -803,7 +907,7 @@ class PyDDEUGui:
             try:
                 self._status_text = "MFT scan (RAW)…"
                 self._status_pct = 0
-                src = open_source(self.source_path)
+                src = open_source(self.source_path, config=self.config)
                 count = 0
                 collected = []
                 total = src.size() or 0
@@ -859,7 +963,7 @@ class PyDDEUGui:
 
         def worker() -> None:
             try:
-                src = open_source(self.source_path)
+                src = open_source(self.source_path, config=self.config)
                 self._log("INFO", f"Starting RAW file carving to: {out_dir}")
                 self._status_text = "RAW file carve…"
                 self._status_pct = 0
@@ -983,7 +1087,7 @@ class PyDDEUGui:
         if nonres is not None:
             part_off, cluster_size, runs, expected = nonres
             try:
-                src = open_source(self.source_path)
+                src = open_source(self.source_path, config=self.config)
                 recover_nonresident_runs(
                     src,
                     self.state,
@@ -1008,7 +1112,7 @@ class PyDDEUGui:
             def worker() -> None:
                 self._log("INFO", f"Recovering via pytsk3 -> {target_path}")
                 try:
-                    src = open_source(self.source_path)
+                    src = open_source(self.source_path, config=self.config)
                     img = DDEUImg(src, self.state, log_cb=log_cb)
                     fs = pytsk3.FS_Info(img, offset=part_offset)
                     exporter = RobustExporter(fs, self.state, log_cb=self._log)
@@ -1056,7 +1160,7 @@ class PyDDEUGui:
             try:
                 self._status_text = "Imaging…"
                 self._status_pct = 0
-                src = open_source(self.source_path)
+                src = open_source(self.source_path, config=self.config)
                 self._log("INFO", f"Imaging started -> {out_path}")
                 create_image(src, self.state, Path(out_path), log_cb=log_cb, progress_cb=progress)
                 src.close()
@@ -1101,7 +1205,7 @@ class PyDDEUGui:
             try:
                 self._status_text = "Imaging partition…"
                 self._status_pct = 0
-                src = open_source(self.source_path)
+                src = open_source(self.source_path, config=self.config)
                 start = int(part.start_offset)
                 end = int(part.start_offset + part.length)
                 self._log("INFO", f"Partition imaging started [{start}..{end}) -> {out_path}")
@@ -1455,7 +1559,7 @@ class PyDDEUGui:
 
         def connect_img():
             try:
-                s = open_source(self.source_path)
+                s = open_source(self.source_path, config=self.config)
                 i = DDEUImg(s, self.state, log_cb=self._log)
                 return s, i
             except Exception as e:
