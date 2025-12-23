@@ -59,6 +59,8 @@ class PyDDEUGui:
         self.source = None
         self._monitor_thread = None
         self.output_root = _default_output_root()
+        self._refresh_inflight = False
+        self._last_refresh_ts = 0.0
 
         self.state = RecoveryState(map_path=Path("pyddeu.map.json"))
         self.partitions: list[Partition] = []
@@ -121,17 +123,35 @@ class PyDDEUGui:
             side=tk.LEFT, padx=2
         )
         ttk.Button(toolbar, text="Parse NTFS", command=self.action_parse_fs).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="MFT Scan (RAW)", command=self.action_mft_scan).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="File Carve (RAW)", command=self.action_file_carve).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Deep Scan (NTFS)", command=self.action_deep_ntfs_scan).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Create Image…", command=self.action_create_image).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Image Selected Part…", command=self.action_image_selected_partition).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(toolbar, text="Export All…", command=self.action_export_all).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Recover All (Zero-fill)…", command=self.action_recover_all).pack(
-            side=tk.LEFT, padx=2
-        )
+
+        actions_btn = ttk.Menubutton(toolbar, text="Actions")
+
+        actions_btn.pack(side=tk.LEFT, padx=2)
+
+        actions_menu = tk.Menu(actions_btn, tearoff=0)
+
+        actions_btn["menu"] = actions_menu
+
+        actions_menu.add_command(label="MFT Scan (RAW)", command=self.action_mft_scan)
+
+        actions_menu.add_command(label="File Carve (RAW)", command=self.action_file_carve)
+
+        actions_menu.add_command(label="Deep Scan (NTFS)", command=self.action_deep_ntfs_scan)
+
+        actions_menu.add_separator()
+
+        actions_menu.add_command(label="Create Image", command=self.action_create_image)
+
+        actions_menu.add_command(label="Image Selected Part", command=self.action_image_selected_partition)
+
+        actions_menu.add_separator()
+
+        actions_menu.add_command(label="Export All", command=self.action_export_all)
+
+        actions_menu.add_command(label="Recover All (Zero-fill)", command=self.action_recover_all)
+
+        actions_menu.add_command(label="Recover All (MFT)", command=self.action_recover_all_mft)
+
 
         btn_stop = tk.Button(
             toolbar, text="STOP", bg="#8B0000", fg="white", command=self.action_stop
@@ -212,8 +232,24 @@ class PyDDEUGui:
         filter_frame.pack(fill=tk.X)
         ttk.Label(filter_frame, text="Export filter (extensions, comma):").pack(side=tk.LEFT)
         self.entry_ext = ttk.Entry(filter_frame, width=35)
-        self.entry_ext.insert(0, "jpg,jpeg,png,pdf,doc,docx,xls,xlsx,zip,rar,7z,txt")
+        self.entry_ext.insert(0, "jpg,jpeg,png,pdf,doc,docx,xls,xlsx,txt")
         self.entry_ext.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(filter_frame, text="Max size (MB, 0=off):").pack(side=tk.LEFT, padx=(10, 0))
+        self.entry_max_mb = ttk.Entry(filter_frame, width=8)
+        self.entry_max_mb.insert(0, "512")
+        self.entry_max_mb.pack(side=tk.LEFT, padx=5)
+
+        self.var_skip_archives = tk.BooleanVar(value=True)
+        ttk.Checkbutton(filter_frame, text="Skip archives (.zip/.rar/.7z/...)", variable=self.var_skip_archives).pack(
+            side=tk.LEFT, padx=(10, 0)
+        )
+
+        self.var_skip_existing = tk.BooleanVar(value=True)
+        ttk.Checkbutton(filter_frame, text="Skip existing (already recovered)", variable=self.var_skip_existing).pack(
+            side=tk.LEFT, padx=(10, 0)
+        )
+
         self.var_export_deleted = tk.BooleanVar(value=True)
         self.var_export_active = tk.BooleanVar(value=True)
         ttk.Checkbutton(filter_frame, text="Deleted", variable=self.var_export_deleted).pack(side=tk.LEFT)
@@ -221,6 +257,35 @@ class PyDDEUGui:
 
     def _log(self, level: str, msg: str) -> None:
         self.log_queue.put((level, msg))
+
+    def _maybe_refresh_source_async(self, reason: str) -> None:
+        """
+        Best-effort handle refresh after controller resets without blocking the UI.
+        """
+        if self._refresh_inflight:
+            return
+        src = getattr(self, "source", None)
+        refresh = getattr(src, "refresh", None) if src is not None else None
+        if not callable(refresh):
+            return
+
+        now = time.time()
+        if now - float(getattr(self, "_last_refresh_ts", 0.0)) < 8.0:
+            return
+        self._refresh_inflight = True
+        self._last_refresh_ts = now
+
+        def worker() -> None:
+            try:
+                self._log("WARNING", f"Refreshing disk handle (reason: {reason})")
+                refresh()
+                self._log("INFO", "Disk handle refreshed.")
+            except Exception as e:
+                self._log("WARNING", f"Disk handle refresh failed: {e}")
+            finally:
+                self._refresh_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _start_log_consumer(self) -> None:
         try:
@@ -236,6 +301,10 @@ class PyDDEUGui:
                         self._log_file.write(f"[{ts}] [{level}] {msg}\n")
                     except Exception:
                         pass
+                if level == "CRITICAL":
+                    low = str(msg).lower()
+                    if "eventlog:" in low and ("reset to device" in low or "device" in low and "was issued" in low):
+                        self._maybe_refresh_source_async("eventlog reset")
                 # keep UI responsive: cap log lines
                 try:
                     lines = int(self.txt_log.index("end-1c").split(".")[0])
@@ -946,6 +1015,9 @@ class PyDDEUGui:
             return
 
         ext_set = _parse_ext_filter(self.entry_ext.get())
+        max_bytes = _parse_max_mb(self.entry_max_mb.get())
+        skip_archives = bool(self.var_skip_archives.get())
+        skip_existing = bool(self.var_skip_existing.get())
         include_deleted = bool(self.var_export_deleted.get())
         include_active = bool(self.var_export_active.get())
         if not include_deleted and not include_active:
@@ -965,79 +1037,100 @@ class PyDDEUGui:
             exported = 0
             skipped = 0
             total = len(items)
-            for idx, node_id in enumerate(items, start=1):
-                if self.state.stop_requested or not self.state.is_alive:
-                    break
-                try:
-                    part_offset, inode, is_dir = self.node_metadata.get(node_id, (0, 0, False))
-                    if is_dir:
-                        skipped += 1
-                        continue
-                    status = str(self.tree.set(node_id, "status") or "")
-                    if status == "DELETED" and not include_deleted:
-                        skipped += 1
-                        continue
-                    if status == "ACTIVE" and not include_active:
-                        skipped += 1
-                        continue
+            src = None
+            try:
+                src = self.source
+                if src is None:
+                    raise RuntimeError("Disk not connected.")
+                img = DDEUImg(src, self.state, log_cb=self._log)
+                exporter_cache: dict[int, RobustExporter] = {}
 
-                    item_text = self.tree.item(node_id, "text")
-                    rel = _normalize_rel_path(item_text) or f"inode_{inode}"
-                    if ext_set and not _ext_allowed(rel, ext_set):
-                        skipped += 1
-                        continue
-                    target = self._unique_path(self.output_root / rel)
+                for idx, node_id in enumerate(items, start=1):
+                    if self.state.stop_requested or not self.state.is_alive:
+                        break
+                    try:
+                        part_offset, inode, is_dir = self.node_metadata.get(node_id, (0, 0, False))
+                        if is_dir:
+                            skipped += 1
+                            continue
+                        status = str(self.tree.set(node_id, "status") or "")
+                        if status == "DELETED" and not include_deleted:
+                            skipped += 1
+                            continue
+                        if status == "ACTIVE" and not include_active:
+                            skipped += 1
+                            continue
 
-                    # Prefer cached deep-scan recoveries
-                    resident = self._resident_cache.get(node_id)
-                    if resident is not None:
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_bytes(resident)
-                        exported += 1
-                        self._log("INFO", f"Exported (resident): {target}")
-                    else:
-                        nonres = self._nonresident_cache.get(node_id)
-                        if nonres is not None:
-                            part_off2, cluster_size, runs, expected = nonres
-                            src = open_source(self.source_path)
-                            recover_nonresident_runs(
-                                src,
-                                self.state,
-                                target,
-                                part_offset=part_off2,
-                                cluster_size=cluster_size,
-                                runs=runs,
-                                expected_size=expected,
-                                log_cb=self._log,
-                            )
-                            src.close()
+                        item_text = self.tree.item(node_id, "text")
+                        rel = _normalize_rel_path(item_text) or f"inode_{inode}"
+                        file_size = _get_tree_size(self.tree, node_id)
+                        if max_bytes > 0 and file_size > max_bytes:
+                            skipped += 1
+                            self._log("INFO", f"Skipped (too large): {rel} ({file_size} B)")
+                            continue
+                        if skip_archives and _is_archive_path(rel):
+                            skipped += 1
+                            self._log("INFO", f"Skipped (archive): {rel} ({file_size} B)")
+                            continue
+                        if ext_set and not _ext_allowed(rel, ext_set):
+                            skipped += 1
+                            continue
+                        target = (self.output_root / rel)
+                        if skip_existing and _should_skip_existing(target, file_size):
+                            skipped += 1
+                            continue
+                        if not skip_existing:
+                            target = self._unique_path(target)
+
+                        # Prefer cached deep-scan recoveries
+                        resident = self._resident_cache.get(node_id)
+                        if resident is not None:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(resident)
                             exported += 1
-                            self._log("INFO", f"Exported (non-resident): {target}")
+                            self._log("INFO", f"Exported (resident): {target}")
                         else:
-                            # Fallback pytsk3
-                            src = open_source(self.source_path)
-                            img = DDEUImg(src, self.state, log_cb=self._log)
-                            fs = pytsk3.FS_Info(img, offset=part_offset)
-                            exporter = RobustExporter(fs, self.state, log_cb=self._log)
+                            nonres = self._nonresident_cache.get(node_id)
+                            if nonres is not None:
+                                part_off2, cluster_size, runs, expected = nonres
+                                recover_nonresident_runs(
+                                    src,
+                                    self.state,
+                                    target,
+                                    part_offset=part_off2,
+                                    cluster_size=cluster_size,
+                                    runs=runs,
+                                    expected_size=expected,
+                                    log_cb=self._log,
+                                )
+                                exported += 1
+                                self._log("INFO", f"Exported (non-resident): {target}")
+                            else:
+                                exporter = exporter_cache.get(int(part_offset))
+                                if exporter is None:
+                                    fs = pytsk3.FS_Info(img, offset=int(part_offset))
+                                    exporter = RobustExporter(fs, self.state, log_cb=self._log)
+                                    exporter_cache[int(part_offset)] = exporter
 
-                            def progress(file_off: int, file_size: int) -> None:
-                                base = idx - 1
-                                frac = (file_off / file_size) if file_size > 0 else 0.0
-                                self._status_pct = int(min(99, ((base + frac) / total) * 100))
+                                def progress(file_off: int, file_size2: int) -> None:
+                                    base = idx - 1
+                                    frac = (file_off / file_size2) if file_size2 > 0 else 0.0
+                                    self._status_pct = int(min(99, ((base + frac) / total) * 100))
 
                             ok = exporter.export_inode(inode, target, progress_cb=progress)
-                            src.close()
                             if ok:
                                 exported += 1
                                 self._log("INFO", f"Exported: {target}")
                             else:
                                 skipped += 1
-                except Exception as e:
-                    skipped += 1
-                    self._log("WARNING", f"Export skipped ({node_id}): {e}")
+                    except Exception as e:
+                        skipped += 1
+                        self._log("WARNING", f"Export skipped ({node_id}): {e}")
 
-                self._status_pct = int((idx / total) * 100)
-                self._status_text = f"Exporting… {idx}/{total} (ok={exported} skip={skipped})"
+                    self._status_pct = int((idx / total) * 100)
+                    self._status_text = f"Exporting… {idx}/{total} (ok={exported} skip={skipped})"
+            finally:
+                pass
 
             self._status_text = f"Export done (ok={exported} skip={skipped})"
             self._status_pct = 100
@@ -1073,75 +1166,392 @@ class PyDDEUGui:
             ok_count = 0
             skipped = 0
             total = len(items)
-            for idx, node_id in enumerate(items, start=1):
-                if self.state.stop_requested or not self.state.is_alive:
-                    break
-                try:
-                    part_offset, inode, is_dir = self.node_metadata.get(node_id, (0, 0, False))
-                    if is_dir:
-                        skipped += 1
-                        continue
+            max_bytes = _parse_max_mb(self.entry_max_mb.get())
+            skip_archives = bool(self.var_skip_archives.get())
+            skip_existing = bool(self.var_skip_existing.get())
+            ext_set = _parse_ext_filter(self.entry_ext.get())
+            src = None
+            try:
+                src = self.source
+                if src is None:
+                    raise RuntimeError("Disk not connected.")
+                img = DDEUImg(src, self.state, log_cb=self._log)
+                exporter_cache: dict[int, RobustExporter] = {}
 
-                    item_text = self.tree.item(node_id, "text")
-                    rel = _normalize_rel_path(item_text) or f"inode_{inode}"
-                    target = self._unique_path(self.output_root / rel)
+                for idx, node_id in enumerate(items, start=1):
+                    if self.state.stop_requested or not self.state.is_alive:
+                        break
+                    try:
+                        part_offset, inode, is_dir = self.node_metadata.get(node_id, (0, 0, False))
+                        if is_dir:
+                            skipped += 1
+                            continue
 
-                    resident = self._resident_cache.get(node_id)
-                    if resident is not None:
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_bytes(resident)
-                        ok_count += 1
-                        self._log("INFO", f"Recovered (resident): {target}")
-                    else:
-                        nonres = self._nonresident_cache.get(node_id)
-                        if nonres is not None:
-                            part_off2, cluster_size, runs, expected = nonres
-                            src = open_source(self.source_path)
-                            recover_nonresident_runs(
-                                src,
-                                self.state,
-                                target,
-                                part_offset=part_off2,
-                                cluster_size=cluster_size,
-                                runs=runs,
-                                expected_size=expected,
-                                log_cb=self._log,
-                            )
-                            src.close()
+                        item_text = self.tree.item(node_id, "text")
+                        rel = _normalize_rel_path(item_text) or f"inode_{inode}"
+                        file_size = _get_tree_size(self.tree, node_id)
+                        if max_bytes > 0 and file_size > max_bytes:
+                            skipped += 1
+                            self._log("INFO", f"Skipped (too large): {rel} ({file_size} B)")
+                            continue
+                        if skip_archives and _is_archive_path(rel):
+                            skipped += 1
+                            self._log("INFO", f"Skipped (archive): {rel} ({file_size} B)")
+                            continue
+                        if ext_set and not _ext_allowed(rel, ext_set):
+                            skipped += 1
+                            continue
+                        target = (self.output_root / rel)
+                        if skip_existing and _should_skip_existing(target, file_size):
+                            skipped += 1
+                            continue
+                        if not skip_existing:
+                            target = self._unique_path(target)
+
+                        resident = self._resident_cache.get(node_id)
+                        if resident is not None:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(resident)
                             ok_count += 1
-                            self._log("INFO", f"Recovered (non-resident): {target}")
+                            self._log("INFO", f"Recovered (resident): {target}")
                         else:
-                            src = open_source(self.source_path)
-                            img = DDEUImg(src, self.state, log_cb=self._log)
-                            fs = pytsk3.FS_Info(img, offset=part_offset)
-                            exporter = RobustExporter(fs, self.state, log_cb=self._log)
-
-                            def progress(file_off: int, file_size: int) -> None:
-                                base = idx - 1
-                                frac = (file_off / file_size) if file_size > 0 else 0.0
-                                self._status_pct = int(min(99, ((base + frac) / total) * 100))
-                                self._status_text = (
-                                    f"Recovering (robust). {idx}/{total} (ok={ok_count} skip={skipped})"
+                            nonres = self._nonresident_cache.get(node_id)
+                            if nonres is not None:
+                                part_off2, cluster_size, runs, expected = nonres
+                                recover_nonresident_runs(
+                                    src,
+                                    self.state,
+                                    target,
+                                    part_offset=part_off2,
+                                    cluster_size=cluster_size,
+                                    runs=runs,
+                                    expected_size=expected,
+                                    log_cb=self._log,
                                 )
-
-                            ok = exporter.export_inode(inode, target, progress_cb=progress)
-                            src.close()
-                            if ok:
                                 ok_count += 1
-                                self._log("INFO", f"Recovered: {target}")
+                                self._log("INFO", f"Recovered (non-resident): {target}")
                             else:
-                                skipped += 1
-                except Exception as e:
-                    skipped += 1
-                    self._log("WARNING", f"Recover skipped ({node_id}): {e}")
+                                exporter = exporter_cache.get(int(part_offset))
+                                if exporter is None:
+                                    fs = pytsk3.FS_Info(img, offset=int(part_offset))
+                                    exporter = RobustExporter(fs, self.state, log_cb=self._log)
+                                    exporter_cache[int(part_offset)] = exporter
 
-                self._status_pct = int((idx / total) * 100)
-                self._status_text = f"Recovering (robust). {idx}/{total} (ok={ok_count} skip={skipped})"
+                                def progress(file_off: int, file_size2: int) -> None:
+                                    base = idx - 1
+                                    frac = (file_off / file_size2) if file_size2 > 0 else 0.0
+                                    self._status_pct = int(min(99, ((base + frac) / total) * 100))
+                                    self._status_text = (
+                                        f"Recovering (robust). {idx}/{total} (ok={ok_count} skip={skipped})"
+                                    )
+
+                                ok = exporter.export_inode(inode, target, progress_cb=progress)
+                                if ok:
+                                    ok_count += 1
+                                    self._log("INFO", f"Recovered: {target}")
+                                else:
+                                    skipped += 1
+                    except Exception as e:
+                        skipped += 1
+                        self._log("WARNING", f"Recover skipped ({node_id}): {e}")
+
+                    self._status_pct = int((idx / total) * 100)
+                    self._status_text = f"Recovering (robust). {idx}/{total} (ok={ok_count} skip={skipped})"
+            finally:
+                pass
 
             self._status_text = f"Recover done (ok={ok_count} skip={skipped})"
             self._status_pct = 100
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def action_recover_all_mft(self) -> None:
+        """
+        MFT Analizi sonucu bulunan dosyaları, klasör yapısını koruyarak dışarı aktarır.
+        Sadece listedeki (parsed) dosyaları hedef alır, raw carving yapmaz.
+        """
+        if not self.source:
+            return
+
+        # Eğer liste boşsa uyar
+        if not self.tree.get_children():
+            messagebox.showwarning("Uyarı", "Liste boş. Önce 'Parse NTFS' veya 'Deep Scan' yapın.")
+            return
+
+        target_root = filedialog.askdirectory(title="Kurtarılan Dosyalar Nereye Kaydedilsin?")
+        if not target_root:
+            return
+
+        self.state.stop_requested = False
+        threading.Thread(target=self._thread_recover_all_mft, args=(Path(target_root),), daemon=True).start()
+
+    def _thread_recover_all_mft(self, target_root: Path) -> None:
+
+        self._log("INFO", "=== TOPLU KURTARMA (AKILLI MOD) BASLATILDI ===")
+
+
+        # --- AYARLAR ---
+
+        SKIP_EXISTING = True
+
+        SKIP_LARGE_FILES = True
+
+        MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB SINIRI
+
+        RETRY_LIMIT = 3
+
+
+        items = list(self.tree.get_children(""))
+
+        total = len(items)
+
+        exported = 0
+
+        skipped = 0
+
+        errors = 0
+
+
+        ext_set = _parse_ext_filter(self.entry_ext.get())
+
+
+        def connect_fs(offset: int):
+
+            try:
+
+                s = open_source(self.source_path)
+
+                i = DDEUImg(s, self.state, log_cb=self._log)
+
+                fsi = pytsk3.FS_Info(i, offset=int(offset))
+
+                return s, i, fsi
+
+            except Exception as e:
+
+                self._log("CRITICAL", f"Disk baglantisi kurulamadi: {e}")
+
+                return None, None, None
+
+
+        if not self.node_metadata:
+
+            self._log("WARNING", "Kurtarilacak dosya listesi yok.")
+
+            return
+
+
+        first_meta = next(iter(self.node_metadata.values()))
+
+        current_part_offset = int(first_meta[0])
+
+
+        src, img, fs = connect_fs(current_part_offset)
+
+        if not src:
+
+            return
+
+
+        try:
+
+            for idx, node_id in enumerate(items, start=1):
+
+                if self.state.stop_requested:
+
+                    self._log("WARNING", "Islem durduruldu.")
+
+                    break
+
+
+                meta = self.node_metadata.get(node_id)
+
+                if not meta:
+
+                    skipped += 1
+
+                    continue
+
+
+                part_offset, inode, is_dir = meta
+
+                part_offset = int(part_offset)
+
+                inode = int(inode)
+
+
+                if is_dir:
+
+                    skipped += 1
+
+                    continue
+
+
+                item_text = self.tree.item(node_id, "text")
+
+                rel_path = _normalize_rel_path(item_text) or f"inode_{inode}"
+
+                base_out = target_root / rel_path
+
+
+                try:
+
+                    expected_size = int(self.tree.item(node_id, "values")[0])
+
+                except Exception:
+
+                    expected_size = 0
+
+
+                if ext_set and not _ext_allowed(rel_path, ext_set):
+
+                    skipped += 1
+
+                    continue
+
+
+                if SKIP_EXISTING and base_out.exists():
+
+                    try:
+
+                        existing = int(base_out.stat().st_size or 0)
+
+                    except Exception:
+
+                        existing = 0
+
+                    if expected_size > 0 and existing == expected_size:
+
+                        skipped += 1
+
+                        continue
+
+
+                out_path = self._unique_path(base_out)
+
+
+                if SKIP_LARGE_FILES and expected_size > MAX_FILE_SIZE:
+
+                    self._log("WARNING", f"Buyuk dosya atlandi (>100MB): {rel_path}")
+
+                    try:
+
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+                        with open(str(out_path) + ".skipped", "w", encoding="utf-8") as f:
+
+                            f.write(f"Skipped due to size: {expected_size}")
+
+                    except Exception:
+
+                        pass
+
+                    skipped += 1
+
+                    continue
+
+
+                self._status_text = f"Recovering: {rel_path} ({idx}/{total})"
+
+                self._status_pct = int((idx / total) * 100) if total > 0 else 0
+
+
+                retry_count = 0
+
+                success = False
+
+
+                while retry_count < RETRY_LIMIT:
+
+                    if not fs:
+
+                        self._log("INFO", "Disk baglantisi yenileniyor...")
+
+                        time.sleep(5)
+
+                        src, img, fs = connect_fs(current_part_offset)
+
+                        if not fs:
+
+                            self._log("CRITICAL", "Disk baglantisi basarisiz. Tekrar deneniyor...")
+
+                            time.sleep(10)
+
+                            retry_count += 1
+
+                            continue
+
+
+                    try:
+
+                        exporter = RobustExporter(fs, self.state, log_cb=None)
+
+                        ok = exporter.export_inode(inode, out_path)
+
+                        if ok:
+
+                            exported += 1
+
+                            success = True
+
+                            break
+
+                        raise OSError("Export returned false")
+
+
+                    except Exception as e:
+
+                        retry_count += 1
+
+                        err_msg = str(e).lower()
+
+                        is_fatal = "device" in err_msg or "error" in err_msg or "handle" in err_msg
+
+                        if is_fatal:
+
+                            self._log("CRITICAL", f"Dosya hatasi ({retry_count}/{RETRY_LIMIT}): {rel_path} -> {e}")
+
+                            self._log("INFO", "Disk reset yemis olabilir. Baglanti kapatiliyor...")
+
+                            try:
+
+                                src.close()
+
+                            except Exception:
+
+                                pass
+
+                            src, img, fs = None, None, None
+
+                            time.sleep(10)
+
+                        else:
+
+                            self._log("WARNING", f"Basit hata: {e}")
+
+
+                if not success:
+
+                    errors += 1
+
+                    self._log("ERROR", f"Dosya kurtarilamadi: {rel_path}")
+
+
+        except Exception as e:
+
+            self._log("CRITICAL", f"Ana dongu hatasi: {e}")
+
+        finally:
+
+            if src:
+
+                src.close()
+
+            self._log("INFO", f"=== ISLEM BITTI === Basarili: {exported}, Atlanan: {skipped}, Hatali: {errors}")
+
+            self._status_text = "Recovery Completed"
+
+            self._status_pct = 100
 
     def _unique_path(self, path: Path) -> Path:
         """
@@ -1197,6 +1607,71 @@ def _ext_allowed(rel: str, exts: set[str]) -> bool:
     if "." not in name:
         return False
     return name.rsplit(".", 1)[-1] in exts
+
+
+def _parse_max_mb(raw: str) -> int:
+    try:
+        mb = int((raw or "").strip() or "0")
+    except Exception:
+        mb = 0
+    if mb <= 0:
+        return 0
+    return mb * 1024 * 1024
+
+
+def _get_tree_size(tree: ttk.Treeview, node_id: str) -> int:
+    try:
+        v = tree.set(node_id, "size")
+        return int(v) if v is not None and str(v).strip() else 0
+    except Exception:
+        return 0
+
+
+_ARCHIVE_EXTS = {
+    "zip",
+    "rar",
+    "7z",
+    "tar",
+    "gz",
+    "bz2",
+    "xz",
+    "tgz",
+    "tbz",
+    "tbz2",
+    "txz",
+    "iso",
+    "cab",
+}
+
+
+def _is_archive_path(rel: str) -> bool:
+    name = Path(rel).name.lower()
+    if "." not in name:
+        return False
+    return name.rsplit(".", 1)[-1] in _ARCHIVE_EXTS
+
+
+def _should_skip_existing(path: Path, expected_size: int) -> bool:
+    """
+    Skip only when we are confident the file is already recovered.
+    - If expected_size known (>0): skip when sizes match.
+    - If unknown: skip when destination is non-empty.
+    """
+    try:
+        if not path.exists():
+            return False
+        try:
+            st = path.stat()
+        except Exception:
+            return True
+        existing = int(getattr(st, "st_size", 0) or 0)
+        # Minimize I/O on unstable disks: treat any non-empty existing file as recovered.
+        # (Zero-byte files are treated as incomplete and will be retried.)
+        if existing > 0:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 def _default_output_root() -> Path:

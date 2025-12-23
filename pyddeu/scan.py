@@ -81,7 +81,7 @@ def safe_read_granular(
         nonlocal refreshed
         winerr = getattr(e, "winerror", None)
         err = int(winerr) if winerr is not None else int(getattr(e, "errno", 0) or 0)
-        if err in (995, 1117, 21, 31, 1167):
+        if err in (6, 995, 1117, 21, 31, 1167):
             try:
                 state.register_controller_panic()  # type: ignore[attr-defined]
             except Exception:

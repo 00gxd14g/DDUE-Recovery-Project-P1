@@ -4,38 +4,28 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass, field
 import threading
-import os
 
 from .base import DiskSource, SourceInfo
 
-
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+# --- Sabitler ---
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
 FILE_SHARE_DELETE = 0x00000004
 OPEN_EXISTING = 3
 FILE_ATTRIBUTE_NORMAL = 0x00000080
-FILE_FLAG_OVERLAPPED = 0x40000000
+FILE_BEGIN = 0
 
 INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
-ULONG_PTR = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_uint32
-
-
-class OVERLAPPED(ctypes.Structure):
-    _fields_ = [
-        ("Internal", ULONG_PTR),
-        ("InternalHigh", ULONG_PTR),
-        ("Offset", wintypes.DWORD),
-        ("OffsetHigh", wintypes.DWORD),
-        ("hEvent", wintypes.HANDLE),
-    ]
+# --- Yapılar ---
 
 
 class GET_LENGTH_INFORMATION(ctypes.Structure):
     _fields_ = [("Length", ctypes.c_longlong)]
+
 
 class DISK_GEOMETRY(ctypes.Structure):
     _fields_ = [
@@ -58,7 +48,7 @@ class DISK_GEOMETRY_EX(ctypes.Structure):
 IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
 
-
+# --- Kernel32 Tanımları ---
 kernel32.CreateFileW.argtypes = [
     wintypes.LPCWSTR,
     wintypes.DWORD,
@@ -78,17 +68,17 @@ kernel32.ReadFile.argtypes = [
     wintypes.LPVOID,
     wintypes.DWORD,
     ctypes.POINTER(wintypes.DWORD),
-    ctypes.POINTER(OVERLAPPED),
+    wintypes.LPVOID,
 ]
 kernel32.ReadFile.restype = wintypes.BOOL
 
-kernel32.GetOverlappedResult.argtypes = [
+kernel32.SetFilePointerEx.argtypes = [
     wintypes.HANDLE,
-    ctypes.POINTER(OVERLAPPED),
-    ctypes.POINTER(wintypes.DWORD),
-    wintypes.BOOL,
+    ctypes.c_longlong,
+    ctypes.POINTER(ctypes.c_longlong),
+    wintypes.DWORD,
 ]
-kernel32.GetOverlappedResult.restype = wintypes.BOOL
+kernel32.SetFilePointerEx.restype = wintypes.BOOL
 
 kernel32.DeviceIoControl.argtypes = [
     wintypes.HANDLE,
@@ -105,26 +95,13 @@ kernel32.DeviceIoControl.restype = wintypes.BOOL
 kernel32.GetFileSizeEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_longlong)]
 kernel32.GetFileSizeEx.restype = wintypes.BOOL
 
-kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
-kernel32.CreateEventW.restype = wintypes.HANDLE
-
-kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-kernel32.WaitForSingleObject.restype = wintypes.DWORD
-
-kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(OVERLAPPED)]
-kernel32.CancelIoEx.restype = wintypes.BOOL
-
-WAIT_OBJECT_0 = 0x00000000
-WAIT_TIMEOUT = 0x00000102
-INFINITE = 0xFFFFFFFF
-
 
 def _raise_last_error(prefix: str) -> None:
     err = ctypes.get_last_error()
     raise OSError(err, f"{prefix} (winerr={err})")
 
 
-def _query_size(handle: wintypes.HANDLE) -> int:
+def _query_size(handle: int) -> int:
     size = ctypes.c_longlong()
     if kernel32.GetFileSizeEx(handle, ctypes.byref(size)):
         return int(size.value)
@@ -143,11 +120,10 @@ def _query_size(handle: wintypes.HANDLE) -> int:
     )
     if ok:
         return int(out.Length)
-
     return 0
 
 
-def _query_sector_size(handle: wintypes.HANDLE) -> int:
+def _query_sector_size(handle: int) -> int:
     geom = DISK_GEOMETRY_EX()
     returned = wintypes.DWORD()
     ok = kernel32.DeviceIoControl(
@@ -162,20 +138,17 @@ def _query_sector_size(handle: wintypes.HANDLE) -> int:
     )
     if ok:
         bps = int(geom.Geometry.BytesPerSector)
-        if bps in (512, 4096):
-            return bps
-        if bps > 0:
+        if bps in (512, 1024, 2048, 4096):
             return bps
     return 512
 
 
 @dataclass
-class WindowsOverlappedSource(DiskSource):
+class WindowsSyncSource(DiskSource):
     path: str
-    _handle: wintypes.HANDLE
+    _handle: int
     _size: int
     _sector_size: int
-    _timeout_ms: int = 3000
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def size(self) -> int:
@@ -186,11 +159,11 @@ class WindowsOverlappedSource(DiskSource):
 
     def refresh(self) -> None:
         """
-        Best-effort handle refresh after a device reset.
+        Best-effort handle refresh after a device reset/controller panic.
         """
         with self._lock:
             try:
-                if self._handle and self._handle != INVALID_HANDLE_VALUE:
+                if self._handle != INVALID_HANDLE_VALUE:
                     kernel32.CloseHandle(self._handle)
             except Exception:
                 pass
@@ -201,132 +174,110 @@ class WindowsOverlappedSource(DiskSource):
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 None,
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                FILE_ATTRIBUTE_NORMAL,
                 None,
             )
             if handle == INVALID_HANDLE_VALUE:
+                self._handle = INVALID_HANDLE_VALUE
                 _raise_last_error(f"CreateFileW failed for {self.path!r}")
 
             self._handle = handle
             self._size = _query_size(handle)
             self._sector_size = _query_sector_size(handle)
 
-    def _read_aligned(self, offset: int, size: int) -> bytes:
+    def read_at(self, offset: int, size: int) -> bytes:
+        """
+        Senkron ve Sektör Hizalı Okuma (Synchronous Aligned Read).
+        Error 87/22'yi önlemek için her zaman sektör hizalı okuma yapar.
+        """
         if size <= 0:
             return b""
 
-        buf = ctypes.create_string_buffer(size)
-        ov = OVERLAPPED()
-        ov.Offset = wintypes.DWORD(offset & 0xFFFFFFFF)
-        ov.OffsetHigh = wintypes.DWORD((offset >> 32) & 0xFFFFFFFF)
-        ov.hEvent = kernel32.CreateEventW(None, True, False, None)
-        if not ov.hEvent:
-            _raise_last_error("CreateEventW failed")
-        read = wintypes.DWORD(0)
-
-        try:
-            ok = kernel32.ReadFile(self._handle, buf, size, ctypes.byref(read), ctypes.byref(ov))
-            if not ok:
-                err = ctypes.get_last_error()
-                if err != 997:  # ERROR_IO_PENDING
-                    _raise_last_error(f"ReadFile failed at offset={offset} size={size}")
-
-                timeout = int(self._timeout_ms) if int(self._timeout_ms) > 0 else INFINITE
-                w = kernel32.WaitForSingleObject(ov.hEvent, timeout)
-                if w == WAIT_TIMEOUT:
-                    try:
-                        kernel32.CancelIoEx(self._handle, ctypes.byref(ov))
-                    except Exception:
-                        pass
-                    raise OSError(995, f"Read timed out at offset={offset} size={size}")
-                if w != WAIT_OBJECT_0:
-                    _raise_last_error(f"WaitForSingleObject failed at offset={offset} size={size}")
-
-                ok2 = kernel32.GetOverlappedResult(self._handle, ctypes.byref(ov), ctypes.byref(read), False)
-                if not ok2:
-                    _raise_last_error(f"GetOverlappedResult failed at offset={offset} size={size}")
-
-            return buf.raw[: int(read.value)]
-        finally:
-            try:
-                if ov.hEvent:
-                    kernel32.CloseHandle(ov.hEvent)
-            except Exception:
-                pass
-
-    def read_at(self, offset: int, size: int) -> bytes:
-        """
-        DMDE-style aligned buffering:
-        Many Windows disk devices reject unaligned or sub-sector reads with ERROR_INVALID_PARAMETER (87).
-        We always read whole sectors from an aligned offset, then slice the requested bytes from RAM.
-        """
         with self._lock:
-            if size <= 0:
+            if self._handle == INVALID_HANDLE_VALUE:
                 return b""
 
             sector = int(self._sector_size or 512)
             if sector <= 0:
                 sector = 512
 
-            dev_size = int(self._size or 0)
-            if dev_size > 0 and offset >= dev_size:
+            # Hizalama Hesaplaması
+            aligned_start = offset - (offset % sector)
+            end_offset = offset + size
+            aligned_end = ((end_offset + sector - 1) // sector) * sector
+            aligned_read_len = aligned_end - aligned_start
+
+            if self._size > 0 and aligned_start >= self._size:
                 return b""
 
-            aligned_off = offset - (offset % sector)
-            end = offset + size
-            aligned_end = ((end + sector - 1) // sector) * sector
-            aligned_size = aligned_end - aligned_off
+            # Disk sonunu aşma kontrolü (ve 87 önlemek için sektöre hizala)
+            if self._size > 0 and (aligned_start + aligned_read_len) > self._size:
+                aligned_read_len = self._size - aligned_start
+                aligned_read_len -= aligned_read_len % sector
 
-            if dev_size > 0:
-                max_read = dev_size - aligned_off
-                if max_read <= 0:
+            if aligned_read_len <= 0:
+                return b""
+
+            # ReadFile DWORD size sınırı
+            max_dword = 0xFFFFFFFF
+            if aligned_read_len > max_dword:
+                aligned_read_len = max_dword - (max_dword % sector)
+                if aligned_read_len <= 0:
                     return b""
-                if aligned_size > max_read:
-                    aligned_size = max_read
-                    aligned_size -= aligned_size % sector
-                    if aligned_size <= 0:
-                        return b""
 
-            # Fast path: already aligned
-            if aligned_off == offset and aligned_size == size:
-                return self._read_aligned(offset, size)
+            # 1. İmleci ayarla
+            ptr = ctypes.c_longlong(aligned_start)
+            if not kernel32.SetFilePointerEx(self._handle, ptr, None, FILE_BEGIN):
+                _raise_last_error(f"SetFilePointerEx failed @ {aligned_start}")
 
-            data = self._read_aligned(aligned_off, aligned_size)
-            rel = offset - aligned_off
-            sliced = data[rel : rel + size]
-            if len(sliced) < size:
-                sliced += b"\x00" * (size - len(sliced))
-            return sliced
+            # 2. Oku
+            buf = ctypes.create_string_buffer(aligned_read_len)
+            read_bytes = wintypes.DWORD()
+
+            ok = kernel32.ReadFile(self._handle, buf, aligned_read_len, ctypes.byref(read_bytes), None)
+            if not ok:
+                # Okuma başarısız olursa OSError fırlat (Üst katman bunu Bad Sector olarak işaretler)
+                _raise_last_error(f"ReadFile failed @ {aligned_start}")
+
+            actual_len = int(read_bytes.value)
+            if actual_len <= 0:
+                return b""
+
+            # 3. İstenen veriyi kesip al
+            data_start = offset - aligned_start
+            data_end = data_start + size
+            available_data = buf.raw[:actual_len]
+
+            if data_start >= len(available_data):
+                return b""
+            return available_data[data_start:data_end]
 
     def close(self) -> None:
         with self._lock:
-            if self._handle and self._handle != INVALID_HANDLE_VALUE:
+            if self._handle != INVALID_HANDLE_VALUE:
                 kernel32.CloseHandle(self._handle)
-                self._handle = wintypes.HANDLE(INVALID_HANDLE_VALUE)
+                self._handle = INVALID_HANDLE_VALUE
 
 
 def open_windows_source(path: str) -> DiskSource:
+    # FILE_FLAG_OVERLAPPED yok -> Senkron Mod (Daha güvenli)
     handle = kernel32.CreateFileW(
         path,
         GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         None,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+        FILE_ATTRIBUTE_NORMAL,
         None,
     )
+
     if handle == INVALID_HANDLE_VALUE:
         _raise_last_error(f"CreateFileW failed for {path!r}")
 
     size = _query_size(handle)
     sector_size = _query_sector_size(handle)
-    try:
-        timeout_ms = int(os.getenv("PYDDEU_TIMEOUT_MS", "3000").strip() or "3000")
-    except Exception:
-        timeout_ms = 3000
-    return WindowsOverlappedSource(
-        path=path, _handle=handle, _size=size, _sector_size=sector_size, _timeout_ms=timeout_ms
-    )
+
+    return WindowsSyncSource(path=path, _handle=handle, _size=size, _sector_size=sector_size)
 
 
 def list_physical_drives(max_index: int = 32) -> list[SourceInfo]:
