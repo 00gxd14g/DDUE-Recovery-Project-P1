@@ -114,15 +114,16 @@ class PyDDEUGui:
         self.entry_output.pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="Browse…", command=self.action_browse_output).pack(side=tk.LEFT, padx=2)
 
-        ttk.Button(toolbar, text="Browse Image…", command=self.action_browse_image).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(toolbar, text="List Disks", command=self.action_list_disks).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Connect", command=self.action_connect).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Scan Partitions", command=self.action_scan_partitions).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(toolbar, text="Parse NTFS", command=self.action_parse_fs).pack(side=tk.LEFT, padx=2)
+        source_btn = ttk.Menubutton(toolbar, text="Source")
+        source_btn.pack(side=tk.LEFT, padx=2)
+        source_menu = tk.Menu(source_btn, tearoff=0)
+        source_btn["menu"] = source_menu
+        source_menu.add_command(label="Browse Image…", command=self.action_browse_image)
+        source_menu.add_command(label="List Disks", command=self.action_list_disks)
+        source_menu.add_separator()
+        source_menu.add_command(label="Connect", command=self.action_connect)
+        source_menu.add_command(label="Scan Partitions", command=self.action_scan_partitions)
+        source_menu.add_command(label="Parse NTFS", command=self.action_parse_fs)
 
         actions_btn = ttk.Menubutton(toolbar, text="Actions")
 
@@ -241,19 +242,23 @@ class PyDDEUGui:
         self.entry_max_mb.pack(side=tk.LEFT, padx=5)
 
         self.var_skip_archives = tk.BooleanVar(value=True)
-        ttk.Checkbutton(filter_frame, text="Skip archives (.zip/.rar/.7z/...)", variable=self.var_skip_archives).pack(
-            side=tk.LEFT, padx=(10, 0)
-        )
-
         self.var_skip_existing = tk.BooleanVar(value=True)
-        ttk.Checkbutton(filter_frame, text="Skip existing (already recovered)", variable=self.var_skip_existing).pack(
-            side=tk.LEFT, padx=(10, 0)
-        )
-
         self.var_export_deleted = tk.BooleanVar(value=True)
         self.var_export_active = tk.BooleanVar(value=True)
-        ttk.Checkbutton(filter_frame, text="Deleted", variable=self.var_export_deleted).pack(side=tk.LEFT)
-        ttk.Checkbutton(filter_frame, text="Active", variable=self.var_export_active).pack(side=tk.LEFT, padx=(10, 0))
+
+        filter_opts_btn = ttk.Menubutton(filter_frame, text="Filter Options")
+        filter_opts_btn.pack(side=tk.LEFT, padx=(10, 0))
+        filter_opts_menu = tk.Menu(filter_opts_btn, tearoff=0)
+        filter_opts_btn["menu"] = filter_opts_menu
+        filter_opts_menu.add_checkbutton(
+            label="Skip archives (.zip/.rar/.7z/...)", variable=self.var_skip_archives
+        )
+        filter_opts_menu.add_checkbutton(
+            label="Skip existing (already recovered)", variable=self.var_skip_existing
+        )
+        filter_opts_menu.add_separator()
+        filter_opts_menu.add_checkbutton(label="Include Deleted", variable=self.var_export_deleted)
+        filter_opts_menu.add_checkbutton(label="Include Active", variable=self.var_export_active)
 
     def _log(self, level: str, msg: str) -> None:
         self.log_queue.put((level, msg))
@@ -1141,7 +1146,7 @@ class PyDDEUGui:
         """
         Bulk recovery using robust, zero-fill export for every listed file.
 
-        Unlike Export All, this ignores extension and Deleted/Active filters.
+        Unlike Export All, this ignores Deleted/Active filters.
         """
         if not self.source:
             return
@@ -1278,9 +1283,17 @@ class PyDDEUGui:
             messagebox.showwarning("Uyarı", "Liste boş. Önce 'Parse NTFS' veya 'Deep Scan' yapın.")
             return
 
-        target_root = filedialog.askdirectory(title="Kurtarılan Dosyalar Nereye Kaydedilsin?")
+        # Export/Recover ile tutarli olmasi icin once Output alanini kullan.
+        try:
+            out_txt = self.entry_output.get().strip()
+            target_root = Path(out_txt) if out_txt else None
+        except Exception:
+            target_root = None
         if not target_root:
-            return
+            picked = filedialog.askdirectory(title="Kurtarılan Dosyalar Nereye Kaydedilsin?")
+            if not picked:
+                return
+            target_root = Path(picked)
 
         self.state.stop_requested = False
         threading.Thread(target=self._thread_recover_all_mft, args=(Path(target_root),), daemon=True).start()
@@ -1289,268 +1302,182 @@ class PyDDEUGui:
 
         self._log("INFO", "=== TOPLU KURTARMA (AKILLI MOD) BASLATILDI ===")
 
-
-        # --- AYARLAR ---
-
-        SKIP_EXISTING = True
-
-        SKIP_LARGE_FILES = True
-
-        MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB SINIRI
-
-        RETRY_LIMIT = 3
-
-
-        items = list(self.tree.get_children(""))
-
-        total = len(items)
-
-        exported = 0
-
-        skipped = 0
-
-        errors = 0
-
-
+        skip_existing = bool(self.var_skip_existing.get())
+        skip_archives = bool(self.var_skip_archives.get())
         ext_set = _parse_ext_filter(self.entry_ext.get())
 
+        max_bytes_ui = _parse_max_mb(self.entry_max_mb.get())
+        max_file_size = max_bytes_ui if max_bytes_ui > 0 else 100 * 1024 * 1024
+        retry_limit = 3
 
-        def connect_fs(offset: int):
+        items = list(self.tree.get_children(""))
+        total = len(items)
+        exported = 0
+        skipped = 0
+        errors = 0
 
+        def looks_like_device_reset(err: BaseException) -> bool:
+            msg = str(err).lower()
+            needles = (
+                "reset to device",
+                "device was reset",
+                "i/o device error",
+                "io device error",
+                "input/output error",
+                "semaphore timeout",
+                "the device is not ready",
+                "invalid handle",
+                "handle is invalid",
+                "errno 22",
+                "parameter is incorrect",
+                "winerror 6",
+                "winerror 87",
+                "winerror 1117",
+            )
+            return any(n in msg for n in needles)
+
+        def connect_img():
             try:
-
                 s = open_source(self.source_path)
-
                 i = DDEUImg(s, self.state, log_cb=self._log)
-
-                fsi = pytsk3.FS_Info(i, offset=int(offset))
-
-                return s, i, fsi
-
+                return s, i
             except Exception as e:
-
                 self._log("CRITICAL", f"Disk baglantisi kurulamadi: {e}")
+                return None, None
 
-                return None, None, None
-
+        def connect_fs(img_obj: object, offset: int):
+            try:
+                return pytsk3.FS_Info(img_obj, offset=int(offset))
+            except Exception as e:
+                self._log("CRITICAL", f"FS acilamadi (offset={offset}): {e}")
+                return None
 
         if not self.node_metadata:
-
             self._log("WARNING", "Kurtarilacak dosya listesi yok.")
-
             return
 
-
-        first_meta = next(iter(self.node_metadata.values()))
-
-        current_part_offset = int(first_meta[0])
-
-
-        src, img, fs = connect_fs(current_part_offset)
-
-        if not src:
-
-            return
-
+        src = None
+        img = None
+        fs = None
+        current_fs_offset: int | None = None
 
         try:
-
             for idx, node_id in enumerate(items, start=1):
-
-                if self.state.stop_requested:
-
+                if self.state.stop_requested or not self.state.is_alive:
                     self._log("WARNING", "Islem durduruldu.")
-
                     break
 
-
                 meta = self.node_metadata.get(node_id)
-
                 if not meta:
-
                     skipped += 1
-
                     continue
-
 
                 part_offset, inode, is_dir = meta
-
                 part_offset = int(part_offset)
-
                 inode = int(inode)
 
-
                 if is_dir:
-
                     skipped += 1
-
                     continue
-
 
                 item_text = self.tree.item(node_id, "text")
-
                 rel_path = _normalize_rel_path(item_text) or f"inode_{inode}"
-
-                base_out = target_root / rel_path
-
-
-                try:
-
-                    expected_size = int(self.tree.item(node_id, "values")[0])
-
-                except Exception:
-
-                    expected_size = 0
-
+                file_size = _get_tree_size(self.tree, node_id)
 
                 if ext_set and not _ext_allowed(rel_path, ext_set):
-
                     skipped += 1
-
+                    continue
+                if skip_archives and _is_archive_path(rel_path):
+                    skipped += 1
                     continue
 
-
-                if SKIP_EXISTING and base_out.exists():
-
-                    try:
-
-                        existing = int(base_out.stat().st_size or 0)
-
-                    except Exception:
-
-                        existing = 0
-
-                    if expected_size > 0 and existing == expected_size:
-
+                out_path = target_root / rel_path
+                if skip_existing:
+                    if _should_skip_existing(out_path, file_size):
                         skipped += 1
-
                         continue
+                else:
+                    if out_path.exists():
+                        out_path = self._unique_path(out_path)
 
-
-                out_path = self._unique_path(base_out)
-
-
-                if SKIP_LARGE_FILES and expected_size > MAX_FILE_SIZE:
-
-                    self._log("WARNING", f"Buyuk dosya atlandi (>100MB): {rel_path}")
-
+                if max_file_size > 0 and file_size > max_file_size:
+                    self._log("WARNING", f"Buyuk dosya atlandi (>{max_file_size // (1024 * 1024)}MB): {rel_path}")
                     try:
-
                         out_path.parent.mkdir(parents=True, exist_ok=True)
-
                         with open(str(out_path) + ".skipped", "w", encoding="utf-8") as f:
-
-                            f.write(f"Skipped due to size: {expected_size}")
-
+                            f.write(f"Skipped due to size: {file_size}")
                     except Exception:
-
                         pass
-
                     skipped += 1
-
                     continue
 
-
-                self._status_text = f"Recovering: {rel_path} ({idx}/{total})"
-
+                self._status_text = f"Recovering (MFT): {rel_path} ({idx}/{total})"
                 self._status_pct = int((idx / total) * 100) if total > 0 else 0
 
-
                 retry_count = 0
-
                 success = False
-
-
-                while retry_count < RETRY_LIMIT:
-
-                    if not fs:
-
+                while retry_count < retry_limit and not self.state.stop_requested and self.state.is_alive:
+                    if src is None or img is None:
                         self._log("INFO", "Disk baglantisi yenileniyor...")
-
                         time.sleep(5)
-
-                        src, img, fs = connect_fs(current_part_offset)
-
-                        if not fs:
-
+                        src, img = connect_img()
+                        fs = None
+                        current_fs_offset = None
+                        if src is None or img is None:
                             self._log("CRITICAL", "Disk baglantisi basarisiz. Tekrar deneniyor...")
-
                             time.sleep(10)
-
                             retry_count += 1
-
                             continue
 
+                    if fs is None or current_fs_offset != part_offset:
+                        fs = connect_fs(img, part_offset)
+                        current_fs_offset = part_offset if fs is not None else None
+                        if fs is None:
+                            retry_count += 1
+                            time.sleep(5)
+                            continue
 
                     try:
-
                         exporter = RobustExporter(fs, self.state, log_cb=None)
-
                         ok = exporter.export_inode(inode, out_path)
-
                         if ok:
-
                             exported += 1
-
                             success = True
-
                             break
-
                         raise OSError("Export returned false")
-
-
                     except Exception as e:
-
                         retry_count += 1
-
-                        err_msg = str(e).lower()
-
-                        is_fatal = "device" in err_msg or "error" in err_msg or "handle" in err_msg
-
-                        if is_fatal:
-
-                            self._log("CRITICAL", f"Dosya hatasi ({retry_count}/{RETRY_LIMIT}): {rel_path} -> {e}")
-
+                        if looks_like_device_reset(e):
+                            self._log(
+                                "CRITICAL",
+                                f"Dosya hatasi ({retry_count}/{retry_limit}): {rel_path} -> {e}",
+                            )
                             self._log("INFO", "Disk reset yemis olabilir. Baglanti kapatiliyor...")
-
                             try:
-
-                                src.close()
-
+                                if src is not None:
+                                    src.close()
                             except Exception:
-
                                 pass
-
                             src, img, fs = None, None, None
-
+                            current_fs_offset = None
                             time.sleep(10)
-
                         else:
-
-                            self._log("WARNING", f"Basit hata: {e}")
-
+                            self._log("WARNING", f"Hata ({retry_count}/{retry_limit}): {rel_path} -> {e}")
+                            time.sleep(1)
 
                 if not success:
-
                     errors += 1
-
                     self._log("ERROR", f"Dosya kurtarilamadi: {rel_path}")
-
-
         except Exception as e:
-
             self._log("CRITICAL", f"Ana dongu hatasi: {e}")
-
         finally:
-
-            if src:
-
-                src.close()
-
+            try:
+                if src is not None:
+                    src.close()
+            except Exception:
+                pass
             self._log("INFO", f"=== ISLEM BITTI === Basarili: {exported}, Atlanan: {skipped}, Hatali: {errors}")
-
             self._status_text = "Recovery Completed"
-
             self._status_pct = 100
 
     def _unique_path(self, path: Path) -> Path:
@@ -1665,11 +1592,9 @@ def _should_skip_existing(path: Path, expected_size: int) -> bool:
         except Exception:
             return True
         existing = int(getattr(st, "st_size", 0) or 0)
-        # Minimize I/O on unstable disks: treat any non-empty existing file as recovered.
-        # (Zero-byte files are treated as incomplete and will be retried.)
-        if existing > 0:
-            return True
-        return False
+        if expected_size and expected_size > 0:
+            return existing == int(expected_size)
+        return existing > 0
     except Exception:
         return False
 

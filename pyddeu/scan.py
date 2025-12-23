@@ -81,11 +81,13 @@ def safe_read_granular(
         nonlocal refreshed
         winerr = getattr(e, "winerror", None)
         err = int(winerr) if winerr is not None else int(getattr(e, "errno", 0) or 0)
-        if err in (6, 995, 1117, 21, 31, 1167):
+        if err in (6, 21, 31, 55, 995, 1117, 1167):
             try:
                 state.register_controller_panic()  # type: ignore[attr-defined]
             except Exception:
                 pass
+            if log_cb:
+                log_cb("CRITICAL", f"Controller panic detected (err={err}) @ {offset} (+{size})")
             if not refreshed:
                 refreshed = True
                 try:
@@ -109,9 +111,6 @@ def safe_read_granular(
     sec = int(sector_size or (src.sector_size() or 512) or 512)
     if sec <= 0:
         sec = 512
-    if sec >= size:
-        # No benefit in retrying sector-by-sector when the requested read is already <= 1 sector.
-        return b"\x00" * size
 
     buf = bytearray(b"\x00" * size)
     end = offset + size

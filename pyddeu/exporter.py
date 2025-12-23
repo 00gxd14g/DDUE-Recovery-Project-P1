@@ -14,7 +14,7 @@ ProgressCb = Callable[[int, int], None]
 class RobustExporter:
     """
     Ultra-robust export for unstable disks/controllers:
-    - Read in 4KiB chunks (SSD-friendly).
+    - Read in larger chunks to reduce IOPS.
     - On error: zero-fill the chunk, cooldown (seconds), and quickly skip out of dead zones.
     - Skip size grows exponentially up to a cap; skipped areas are also zero-filled to preserve file size.
     """
@@ -25,7 +25,7 @@ class RobustExporter:
         state: RecoveryState,
         *,
         log_cb: Optional[LogCb] = None,
-        cluster_size: int = 4096,
+        cluster_size: int = 128 * 1024,
         base_skip_size: int = 1024 * 1024,
         max_skip_size: int = 1024 * 1024 * 50,
         cooldown_s: float = 2.0,
@@ -37,6 +37,32 @@ class RobustExporter:
         self.base_skip_size = int(base_skip_size)
         self.max_skip_size = int(max_skip_size)
         self.cooldown_s = float(cooldown_s)
+
+    @staticmethod
+    def _is_controller_error(err: BaseException) -> bool:
+        if isinstance(err, OSError):
+            winerr = getattr(err, "winerror", None)
+            errno = getattr(err, "errno", None)
+            code = int(winerr) if winerr is not None else int(errno or 0)
+            if code in (6, 21, 31, 55, 995, 1117, 1167):
+                return True
+        msg = str(err).lower()
+        needles = (
+            "reset to device",
+            "device was reset",
+            "i/o device error",
+            "io device error",
+            "input/output error",
+            "semaphore timeout",
+            "invalid handle",
+            "handle is invalid",
+            "errno 22",
+            "parameter is incorrect",
+            "winerror 6",
+            "winerror 87",
+            "winerror 1117",
+        )
+        return any(n in msg for n in needles)
 
     def export_inode(self, inode: int, out_path: Path, *, progress_cb: Optional[ProgressCb] = None) -> bool:
         try:
@@ -74,10 +100,15 @@ class RobustExporter:
                         err_msg = str(e)
                         out_file.write(b"\x00" * to_read)
                         offset += to_read
+                        if self._is_controller_error(e):
+                            try:
+                                self.state.register_controller_panic()  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
 
                     if error_hit:
                         consecutive_errors += 1
-                        wait_time = self.cooldown_s * (1 if consecutive_errors < 5 else 2)
+                        wait_time = max(self.cooldown_s, self.cooldown_s * (1 if consecutive_errors < 5 else 2))
                         self._log(
                             "CRITICAL",
                             f"I/O error @{max(0, offset - to_read)} (+{to_read}); cooling down ({wait_time:.2f}s). err={err_msg or 'read returned error zeros'}",

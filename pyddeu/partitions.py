@@ -192,6 +192,8 @@ def carve_ntfs_partitions(
     seen_offsets: set[int] = set()
     offset = 0
     idx = 1
+    chunk_size = max(int(step_bytes), 16 * 1024 * 1024)
+    overlap = 512
 
     def try_ntfs_at(off: int) -> None:
         nonlocal idx
@@ -244,10 +246,24 @@ def carve_ntfs_partitions(
         if log_cb and offset - last_log >= 256 * 1024 * 1024:
             log_cb("INFO", f"NTFS carve progress: offset={offset} hits={len(hits)}")
             last_log = offset
-        try_ntfs_at(offset)
+
+        read_len = min(chunk_size + overlap, size - offset)
+        buf = safe_read_granular(src, state or _NULL_STATE, offset, read_len, log_cb=log_cb)
+        if buf:
+            start = 0
+            while True:
+                pos = buf.find(b"NTFS ", start)
+                if pos == -1:
+                    break
+                if pos >= 3:
+                    cand = offset + pos - 3
+                    if 0 <= cand < size:
+                        try_ntfs_at(cand)
+                start = pos + 1
+
+        step = chunk_size
         if state:
-            offset += max(int(step_bytes), int(getattr(state, "skip_size", step_bytes) or step_bytes))
-        else:
-            offset += step_bytes
+            step = max(step, int(getattr(state, "skip_size", 0) or 0))
+        offset += step
 
     return hits

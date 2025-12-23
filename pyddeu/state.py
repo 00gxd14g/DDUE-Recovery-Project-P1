@@ -124,6 +124,8 @@ class RecoveryState:
             if self.consecutive_errors:
                 self.consecutive_errors = 0
                 self.skip_size = self.block_size
+            if self._panic_level > 0:
+                self._panic_level -= 1
 
     def register_controller_panic(self) -> None:
         """
@@ -131,8 +133,8 @@ class RecoveryState:
         We do NOT auto-stop; instead we pause reads with exponential backoff to avoid a reset loop.
         """
         with self._lock:
-            self._panic_level = min(self._panic_level + 1, 6)
-            pause_s = min(2.0 * (2 ** (self._panic_level - 1)), 30.0)
+            self._panic_level = min(self._panic_level + 1, 10)
+            pause_s = min(60.0, 2.0 * (1.5 ** self._panic_level))
             self.pause_until = max(self.pause_until, time.time() + pause_s)
 
     def wait_if_paused(self) -> None:
@@ -140,9 +142,9 @@ class RecoveryState:
         Blocks briefly when a controller panic is detected, giving the device time to recover.
         Intended to be called inside worker threads before issuing more I/O.
         """
-        while not self.stop_requested and self.is_alive:
-            now = time.time()
-            until = self.pause_until
-            if until <= now:
-                break
-            time.sleep(min(0.25, max(0.01, until - now)))
+        if self.stop_requested or not self.is_alive:
+            return
+        now = time.time()
+        until = self.pause_until
+        if until > now:
+            time.sleep(max(0.01, until - now))
