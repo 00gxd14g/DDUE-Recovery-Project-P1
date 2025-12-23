@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .io.base import DiskSource
+from .io import open_source
+from .ntfs_boot import parse_ntfs_boot_sector
 from .scan import safe_read_granular
 from .state import RecoveryState
 
@@ -178,6 +180,7 @@ def carve_ntfs_partitions(
     validate_backup_boot: bool = True,
     log_cb: Optional[Callable[[str, str], None]] = None,
     progress_cb: Optional[Callable[[int, int, int], None]] = None,
+    source_path: Optional[str] = None,
 ) -> list[Partition]:
     """
     Read-only scan that looks for NTFS boot sectors when the partition table is missing/corrupt.
@@ -194,30 +197,97 @@ def carve_ntfs_partitions(
     idx = 1
     chunk_size = max(int(step_bytes), 16 * 1024 * 1024)
     overlap = 512
+    min_chunk = 1024 * 1024
+    max_chunk = chunk_size
+    current_chunk = chunk_size
+    success_streak = 0
+    cur_src = src
+    owns_src = False
+
+    if source_path:
+        try:
+            cur_src = open_source(source_path)
+            owns_src = True
+        except Exception:
+            cur_src = src
+            owns_src = False
+
+    def reopen_source() -> bool:
+        nonlocal cur_src, owns_src
+        if not source_path:
+            refresh = getattr(cur_src, "refresh", None)
+            if callable(refresh):
+                try:
+                    refresh()
+                    return True
+                except Exception:
+                    return False
+            return False
+        try:
+            new_src = open_source(source_path)
+        except Exception:
+            return False
+        try:
+            if owns_src:
+                cur_src.close()
+        except Exception:
+            pass
+        cur_src = new_src
+        owns_src = True
+        return True
+
+    def read_chunk(off: int, size_bytes: int) -> tuple[bytes, bool]:
+        nonlocal cur_src
+        if state:
+            state.wait_if_paused()
+            if state.stop_requested or not state.is_alive:
+                return b"", False
+            if state.bad_map.contains(off, size_bytes):
+                return b"", True
+        for attempt in range(2):
+            try:
+                data = cur_src.read_at(off, size_bytes)
+                if len(data) < size_bytes:
+                    data += b"\x00" * (size_bytes - len(data))
+                return data, False
+            except OSError as e:
+                if state:
+                    try:
+                        state.register_controller_panic(log_cb=log_cb)
+                    except Exception:
+                        pass
+                if log_cb:
+                    log_cb(
+                        "CRITICAL",
+                        f"Carve chunk read failed @{off} (+{size_bytes}) attempt {attempt + 1}: {e}",
+                    )
+                if attempt == 0 and reopen_source():
+                    continue
+                return b"", True
+        return b"", True
 
     def try_ntfs_at(off: int) -> None:
         nonlocal idx
         if off in seen_offsets:
             return
         seen_offsets.add(off)
-        boot = safe_read_granular(src, state or _NULL_STATE, off, sector_size, log_cb=log_cb)
+        boot = safe_read_granular(cur_src, state or _NULL_STATE, off, sector_size, log_cb=log_cb)
         if len(boot) < max(90, sector_size):
             return
-        if boot[3:7] != b"NTFS":
-            return
-        if boot[510:512] != b"\x55\xAA":
+        parsed = parse_ntfs_boot_sector(boot)
+        if not parsed:
             return
 
-        bps = int(struct.unpack_from("<H", boot, 11)[0]) or sector_size
-        total_sectors = int(struct.unpack_from("<Q", boot, 40)[0])
-        length = total_sectors * bps if total_sectors > 0 else 0
+        bps = parsed.bytes_per_sector
+        total_sectors = parsed.total_sectors
+        length = parsed.volume_size_bytes
 
         type_str = "NTFS (carved boot sector)"
         if validate_backup_boot and total_sectors > 0:
             backup_off = off + (total_sectors - 1) * bps
             if 0 <= backup_off < size:
-                backup = safe_read_granular(src, state or _NULL_STATE, backup_off, bps, log_cb=log_cb)
-                if len(backup) >= 512 and backup[3:7] == b"NTFS" and backup[510:512] == b"\x55\xAA":
+                backup = safe_read_granular(cur_src, state or _NULL_STATE, backup_off, bps, log_cb=log_cb)
+                if parse_ntfs_boot_sector(backup):
                     type_str = "NTFS (carved boot sector + backup validated)"
                 else:
                     type_str = "NTFS (carved, backup boot not validated)"
@@ -235,35 +305,63 @@ def carve_ntfs_partitions(
         idx += 1
 
     last_log = 0
-    while offset < size and len(hits) < max_hits:
-        if state and (state.stop_requested or not state.is_alive):
-            break
-        if progress_cb:
+    try:
+        while offset < size and len(hits) < max_hits:
+            if state and (state.stop_requested or not state.is_alive):
+                break
+            if progress_cb:
+                try:
+                    progress_cb(offset, size, len(hits))
+                except Exception:
+                    pass
+            if log_cb and offset - last_log >= 256 * 1024 * 1024:
+                log_cb("INFO", f"NTFS carve progress: offset={offset} hits={len(hits)}")
+                last_log = offset
+
+            base_len = min(current_chunk, size - offset)
+            if base_len <= 0:
+                break
+            read_len = min(base_len + overlap, size - offset)
+            # Fast path: avoid granular sector fallback on huge chunks (prevents UI freeze).
+            buf, had_error = read_chunk(offset, read_len)
+            if had_error or not buf:
+                if state:
+                    state.register_error(offset, max(1, base_len))
+                success_streak = 0
+                current_chunk = max(min_chunk, current_chunk // 2)
+                step = base_len
+                if state:
+                    step = max(step, int(getattr(state, "skip_size", 0) or 0))
+                if log_cb:
+                    log_cb("WARNING", f"Carve read error; chunk reduced to {current_chunk // (1024 * 1024)}MB")
+                offset += step
+                continue
+
+            success_streak += 1
+            if success_streak >= 4 and current_chunk < max_chunk:
+                current_chunk = min(max_chunk, current_chunk * 2)
+                success_streak = 0
+            if buf:
+                start = 0
+                while True:
+                    pos = buf.find(b"NTFS ", start)
+                    if pos == -1:
+                        break
+                    if pos >= 3:
+                        cand = offset + pos - 3
+                        if 0 <= cand < size:
+                            try_ntfs_at(cand)
+                    start = pos + 1
+
+            step = base_len
+            if state:
+                step = max(step, int(getattr(state, "skip_size", 0) or 0))
+            offset += step
+    finally:
+        if owns_src:
             try:
-                progress_cb(offset, size, len(hits))
+                cur_src.close()
             except Exception:
                 pass
-        if log_cb and offset - last_log >= 256 * 1024 * 1024:
-            log_cb("INFO", f"NTFS carve progress: offset={offset} hits={len(hits)}")
-            last_log = offset
-
-        read_len = min(chunk_size + overlap, size - offset)
-        buf = safe_read_granular(src, state or _NULL_STATE, offset, read_len, log_cb=log_cb)
-        if buf:
-            start = 0
-            while True:
-                pos = buf.find(b"NTFS ", start)
-                if pos == -1:
-                    break
-                if pos >= 3:
-                    cand = offset + pos - 3
-                    if 0 <= cand < size:
-                        try_ntfs_at(cand)
-                start = pos + 1
-
-        step = chunk_size
-        if state:
-            step = max(step, int(getattr(state, "skip_size", 0) or 0))
-        offset += step
 
     return hits

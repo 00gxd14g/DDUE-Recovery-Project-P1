@@ -122,36 +122,20 @@ class PyDDEUGui:
         source_menu.add_command(label="List Disks", command=self.action_list_disks)
         source_menu.add_separator()
         source_menu.add_command(label="Connect", command=self.action_connect)
-        source_menu.add_command(label="Scan Partitions", command=self.action_scan_partitions)
-        source_menu.add_command(label="Parse NTFS", command=self.action_parse_fs)
 
-        actions_btn = ttk.Menubutton(toolbar, text="Actions")
+        smart_btn = ttk.Button(toolbar, text="Start Smart Recovery", command=self.action_smart_recovery)
+        smart_btn.pack(side=tk.LEFT, padx=(10, 2))
 
+        actions_btn = ttk.Menubutton(toolbar, text="Recovery")
         actions_btn.pack(side=tk.LEFT, padx=2)
-
         actions_menu = tk.Menu(actions_btn, tearoff=0)
-
         actions_btn["menu"] = actions_menu
-
-        actions_menu.add_command(label="MFT Scan (RAW)", command=self.action_mft_scan)
-
-        actions_menu.add_command(label="File Carve (RAW)", command=self.action_file_carve)
-
-        actions_menu.add_command(label="Deep Scan (NTFS)", command=self.action_deep_ntfs_scan)
-
-        actions_menu.add_separator()
-
-        actions_menu.add_command(label="Create Image", command=self.action_create_image)
-
-        actions_menu.add_command(label="Image Selected Part", command=self.action_image_selected_partition)
-
-        actions_menu.add_separator()
-
         actions_menu.add_command(label="Export All", command=self.action_export_all)
-
         actions_menu.add_command(label="Recover All (Zero-fill)", command=self.action_recover_all)
-
         actions_menu.add_command(label="Recover All (MFT)", command=self.action_recover_all_mft)
+        actions_menu.add_separator()
+        actions_menu.add_command(label="Create Image", command=self.action_create_image)
+        actions_menu.add_command(label="Image Selected Part", command=self.action_image_selected_partition)
 
 
         btn_stop = tk.Button(
@@ -291,6 +275,122 @@ class PyDDEUGui:
                 self._refresh_inflight = False
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def action_smart_recovery(self) -> None:
+        if not self.source:
+            return
+        self.state.stop_requested = False
+        self.list_parts.delete(0, tk.END)
+        self.partitions = []
+        self.tree.delete(*self.tree.get_children())
+        self.node_metadata = {}
+        self._resident_cache = {}
+        self._nonresident_cache = {}
+        self._status_text = "Smart recovery starting."
+        self._status_pct = None
+
+        def worker() -> None:
+            try:
+                self.state.wait_if_paused()
+                parts = scan_partitions(self.source, state=self.state, log_cb=self._log)
+                if not parts:
+                    self._log("WARNING", "No MBR/GPT partitions found. Trying optimized NTFS boot carve.")
+                    total = self.source.size() or 0
+
+                    def prog(off: int, total_size: int, hits: int) -> None:
+                        if total_size > 0:
+                            self._status_pct = int(min(99, (off / total_size) * 100))
+                        self._status_text = f"Carving NTFS boots. hits={hits}"
+
+                    parts = carve_ntfs_partitions(
+                        self.source,
+                        state=self.state,
+                        log_cb=self._log,
+                        progress_cb=prog,
+                        source_path=self.source_path,
+                    )
+                    if not parts:
+                        self._log("WARNING", "No carved NTFS boot sectors found. Falling back to RAW carve.")
+                        self._run_raw_carve(label="Smart Recovery")
+                        return
+
+                for p in parts:
+                    self.partitions.append(p)
+                    self.ui_queue.put(p)
+                self._log("INFO", f"Partitions: {len(parts)}")
+
+                picked = self._pick_smart_partition(parts)
+                if not picked:
+                    self._log("WARNING", "No suitable partition selected. Falling back to RAW carve.")
+                    self._run_raw_carve(label="Smart Recovery")
+                    return
+
+                found = self._run_deep_ntfs_scan(picked, label="Smart Recovery")
+                if found <= 0:
+                    self._log("WARNING", "Deep scan returned no records. Falling back to RAW carve.")
+                    self._run_raw_carve(label="Smart Recovery")
+            except Exception as e:
+                self._log("CRITICAL", f"Smart recovery failed: {e}")
+                self._status_text = "Smart recovery failed"
+                self._status_pct = None
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _pick_smart_partition(self, parts: list[Partition]) -> Partition | None:
+        if not parts:
+            return None
+
+        def score(p: Partition) -> tuple[int, int]:
+            t = str(p.type_str or "").upper()
+            is_ntfs = 1 if "NTFS" in t else 0
+            return (is_ntfs, int(p.length))
+
+        return max(parts, key=score)
+
+    def _run_raw_carve(self, *, label: str = "") -> int:
+        try:
+            out_txt = self.entry_output.get().strip()
+            out_dir = Path(out_txt) if out_txt else None
+        except Exception:
+            out_dir = None
+
+        if not out_dir:
+            self._log("WARNING", "RAW carve skipped: output folder is not set.")
+            self._status_text = "Smart recovery stopped"
+            self._status_pct = None
+            return 0
+
+        def log_cb(level: str, msg: str) -> None:
+            self._log(level, msg)
+
+        found = 0
+        src = None
+        try:
+            src = open_source(self.source_path)
+            prefix = f"{label} - " if label else ""
+            self._log("INFO", f"{prefix}Starting RAW file carving to: {out_dir}")
+            self._status_text = "RAW file carve."
+            self._status_pct = 0
+
+            def progress2(off: int, total: int) -> None:
+                if total > 0:
+                    self._status_pct = int(min(99, (off / total) * 100))
+
+            found = carve_signatures(src, self.state, Path(out_dir), log_cb=log_cb, progress_cb=progress2)
+            self._log("INFO", f"RAW carving finished. Found: {found}")
+            self._status_text = "RAW carve done"
+            self._status_pct = 100
+        except Exception as e:
+            self._log("CRITICAL", f"RAW carving failed: {e}")
+            self._status_text = "RAW carve failed"
+            self._status_pct = None
+        finally:
+            try:
+                if src:
+                    src.close()
+            except Exception:
+                pass
+        return found
 
     def _start_log_consumer(self) -> None:
         try:
@@ -496,7 +596,13 @@ class PyDDEUGui:
                             self._status_pct = int(min(99, (off / total_size) * 100))
                         self._status_text = f"Carving NTFS boots… hits={hits}"
 
-                    parts = carve_ntfs_partitions(self.source, state=self.state, log_cb=self._log, progress_cb=prog)
+                    parts = carve_ntfs_partitions(
+                        self.source,
+                        state=self.state,
+                        log_cb=self._log,
+                        progress_cb=prog,
+                        source_path=self.source_path,
+                    )
                     if not parts:
                         self._log("WARNING", "No carved NTFS boot sectors found.")
                 for p in parts:
@@ -593,6 +699,12 @@ class PyDDEUGui:
             return
         part = self.partitions[idx]
 
+        def worker() -> None:
+            self._run_deep_ntfs_scan(part, label="Manual")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_deep_ntfs_scan(self, part: Partition, *, label: str = "") -> int:
         self.state.stop_requested = False
         self.tree.delete(*self.tree.get_children())
         self.node_metadata = {}
@@ -602,73 +714,78 @@ class PyDDEUGui:
         def log_cb(level: str, msg: str) -> None:
             self._log(level, msg)
 
-        def worker() -> None:
-            try:
-                self._status_text = "Deep NTFS scan (MFT)…"
-                self._status_pct = 0
-                src = open_source(self.source_path)
-                boot_buf = src.read_at(part.start_offset, 512)
-                boot = parse_ntfs_boot_sector(boot_buf)
-                if not boot:
-                    self._log("CRITICAL", "Selected partition does not look like NTFS boot sector.")
-                    src.close()
-                    self._status_text = "Deep scan failed"
-                    self._status_pct = None
-                    return
-
-                cluster_size = boot.cluster_size
-                self._log("INFO", f"NTFS boot parsed: cluster={cluster_size} record={boot.file_record_size}")
-
-                def progress(off: int, total: int) -> None:
-                    if total > 0:
-                        self._status_pct = int(min(99, (off / total) * 100))
-
-                collected = []
-                for rec in scan_and_parse_mft(
-                    src,
-                    self.state,
-                    start=part.start_offset,
-                    end=part.start_offset + boot.volume_size_bytes,
-                    step=4096,
-                    record_size=boot.file_record_size,
-                    log_cb=log_cb,
-                    progress_cb=progress,
-                ):
-                    if self.state.stop_requested:
-                        break
-                    collected.append(rec)
-                    if len(collected) % 500 == 0:
-                        self._log("INFO", f"Deep scan parsed records: {len(collected)}")
-
-                paths = build_paths(collected)
-                for rec in collected:
-                    status = "DELETED" if rec.is_deleted else "ACTIVE"
-                    size = rec.data_size or (len(rec.resident_data) if rec.resident_data else 0)
-                    self.ui_queue.put(
-                        _TreeItem(
-                            path=f"[DEEP] {paths.get(rec.inode, f'inode_{rec.inode}')}",
-                            size=int(size),
-                            status=status,
-                            inode=rec.inode,
-                            part_offset=part.start_offset,
-                            is_dir=False,
-                            resident_data=rec.resident_data,
-                            data_runs=rec.data_runs,
-                            data_size=rec.data_size,
-                            cluster_size=cluster_size,
-                        )
-                    )
-
-                src.close()
-                self._status_text = "Deep scan done"
-                self._status_pct = 100
-                self._log("INFO", f"Deep scan finished. Records: {len(collected)}")
-            except Exception as e:
-                self._log("CRITICAL", f"Deep scan failed: {e}")
+        src = None
+        try:
+            prefix = f"{label} - " if label else ""
+            self._status_text = f"{prefix}Deep NTFS scan (MFT)..."
+            self._status_pct = 0
+            src = open_source(self.source_path)
+            boot_buf = src.read_at(part.start_offset, 512)
+            boot = parse_ntfs_boot_sector(boot_buf)
+            if not boot:
+                self._log("CRITICAL", "Selected partition does not look like NTFS boot sector.")
                 self._status_text = "Deep scan failed"
                 self._status_pct = None
+                return 0
 
-        threading.Thread(target=worker, daemon=True).start()
+            cluster_size = boot.cluster_size
+            self._log("INFO", f"NTFS boot parsed: cluster={cluster_size} record={boot.file_record_size}")
+
+            def progress(off: int, total: int) -> None:
+                if total > 0:
+                    self._status_pct = int(min(99, (off / total) * 100))
+
+            collected = []
+            for rec in scan_and_parse_mft(
+                src,
+                self.state,
+                start=part.start_offset,
+                end=part.start_offset + boot.volume_size_bytes,
+                step=4096,
+                record_size=boot.file_record_size,
+                log_cb=log_cb,
+                progress_cb=progress,
+            ):
+                if self.state.stop_requested:
+                    break
+                collected.append(rec)
+                if len(collected) % 500 == 0:
+                    self._log("INFO", f"Deep scan parsed records: {len(collected)}")
+
+            paths = build_paths(collected)
+            for rec in collected:
+                status = "DELETED" if rec.is_deleted else "ACTIVE"
+                size = rec.data_size or (len(rec.resident_data) if rec.resident_data else 0)
+                self.ui_queue.put(
+                    _TreeItem(
+                        path=f"[DEEP] {paths.get(rec.inode, f'inode_{rec.inode}')}",
+                        size=int(size),
+                        status=status,
+                        inode=rec.inode,
+                        part_offset=part.start_offset,
+                        is_dir=False,
+                        resident_data=rec.resident_data,
+                        data_runs=rec.data_runs,
+                        data_size=rec.data_size,
+                        cluster_size=cluster_size,
+                    )
+                )
+
+            self._status_text = "Deep scan done"
+            self._status_pct = 100
+            self._log("INFO", f"Deep scan finished. Records: {len(collected)}")
+            return len(collected)
+        except Exception as e:
+            self._log("CRITICAL", f"Deep scan failed: {e}")
+            self._status_text = "Deep scan failed"
+            self._status_pct = None
+            return 0
+        finally:
+            try:
+                if src:
+                    src.close()
+            except Exception:
+                pass
 
     def action_mft_scan(self) -> None:
         if not self.source:

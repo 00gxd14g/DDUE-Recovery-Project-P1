@@ -102,7 +102,7 @@ class RobustExporter:
                         offset += to_read
                         if self._is_controller_error(e):
                             try:
-                                self.state.register_controller_panic()  # type: ignore[attr-defined]
+                                self.state.register_controller_panic(log_cb=self.log_cb)  # type: ignore[attr-defined]
                             except Exception:
                                 pass
 

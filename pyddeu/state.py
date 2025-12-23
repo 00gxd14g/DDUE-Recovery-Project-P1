@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, Optional
 
 
 @dataclass(frozen=True)
@@ -87,6 +87,9 @@ class BadRegionMap:
             return len(self._regions)
 
 
+LogCb = Callable[[str, str], None]
+
+
 class RecoveryState:
     def __init__(
         self,
@@ -127,7 +130,7 @@ class RecoveryState:
             if self._panic_level > 0:
                 self._panic_level -= 1
 
-    def register_controller_panic(self) -> None:
+    def register_controller_panic(self, log_cb: Optional[LogCb] = None) -> None:
         """
         Called when OS logs indicate a device reset/controller panic.
         We do NOT auto-stop; instead we pause reads with exponential backoff to avoid a reset loop.
@@ -136,6 +139,11 @@ class RecoveryState:
             self._panic_level = min(self._panic_level + 1, 10)
             pause_s = min(60.0, 2.0 * (1.5 ** self._panic_level))
             self.pause_until = max(self.pause_until, time.time() + pause_s)
+        if log_cb:
+            try:
+                log_cb("WARNING", f"Controller Panic detected! Pausing for {pause_s:.1f} seconds.")
+            except Exception:
+                pass
 
     def wait_if_paused(self) -> None:
         """
