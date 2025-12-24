@@ -22,7 +22,7 @@ class PyddeuConfig:
     dblbuffer: int = 2097152
     diskcache: int = 16777216
 
-    deviowait_ms: int = 0  # overlapped timeout ms (0 disables overlapped timeout reads)
+    deviowait_ms: int = 5000  # overlapped timeout ms (0 disables overlapped timeout reads)
     scsitimeout_s: int = 5
 
     @staticmethod
@@ -70,6 +70,9 @@ class PyddeuConfig:
         diskcache = int(parser.get("IO", "diskcache", fallback=str(cls.diskcache)) or cls.diskcache)
 
         deviowait = int(parser.get("IO", "deviowait", fallback=str(cls.deviowait_ms)) or cls.deviowait_ms)
+        if deviowait == 0:
+            # Force async I/O to prevent infinite hangs on bad sectors
+            deviowait = 5000
         scsitimeout = int(parser.get("IO", "scsitimeout", fallback=str(cls.scsitimeout_s)) or cls.scsitimeout_s)
 
         # Clamp to sane ranges

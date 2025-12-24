@@ -3,10 +3,20 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass, field
+import struct
 import threading
 
 from .base import DiskSource, SourceInfo
 from ..config import PyddeuConfig
+
+# ULONG_PTR wintypes modülünde her zaman mevcut değil (Python 3.11+).
+# Platform mimarisine göre doğru türü tanımlıyoruz.
+if not hasattr(wintypes, 'ULONG_PTR'):
+    # 64-bit sistemlerde 8 byte, 32-bit sistemlerde 4 byte pointer
+    if struct.calcsize('P') == 8:
+        wintypes.ULONG_PTR = ctypes.c_ulonglong
+    else:
+        wintypes.ULONG_PTR = ctypes.c_ulong
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -18,6 +28,7 @@ FILE_SHARE_DELETE = 0x00000004
 OPEN_EXISTING = 3
 FILE_ATTRIBUTE_NORMAL = 0x00000080
 FILE_BEGIN = 0
+FILE_FLAG_OVERLAPPED = 0x40000000
 
 INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
@@ -243,29 +254,8 @@ class WindowsSyncSource(DiskSource):
         """
         Best-effort handle refresh after a device reset/controller panic.
         """
-        with self._lock:
-            try:
-                if self._handle != INVALID_HANDLE_VALUE:
-                    kernel32.CloseHandle(self._handle)
-            except Exception:
-                pass
-
-            handle = kernel32.CreateFileW(
-                self.path,
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                None,
-            )
-            if handle == INVALID_HANDLE_VALUE:
-                self._handle = INVALID_HANDLE_VALUE
-                _raise_last_error(f"CreateFileW failed for {self.path!r}")
-
-            self._handle = handle
-            self._size = _query_size(handle)
-            self._sector_size = _query_sector_size(handle)
+        if not self.refresh_with_timeout(timeout_s=5.0):
+            raise OSError("Refresh timed out")
 
     def refresh_with_timeout(self, timeout_s: float = 5.0) -> bool:
         """
@@ -280,13 +270,17 @@ class WindowsSyncSource(DiskSource):
 
         def worker() -> None:
             try:
+                flags = FILE_ATTRIBUTE_NORMAL
+                if int(self._overlapped_timeout_ms or 0) > 0:
+                    flags |= FILE_FLAG_OVERLAPPED
+
                 handle = kernel32.CreateFileW(
                     self.path,
                     GENERIC_READ,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     None,
                     OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
+                    flags,
                     None,
                 )
                 if handle == INVALID_HANDLE_VALUE:
@@ -367,6 +361,7 @@ class WindowsSyncSource(DiskSource):
 
             # Timeout'lu overlapped okuma: controller reset aninda bloklanmayi azaltir.
             if int(self._overlapped_timeout_ms or 0) > 0:
+                # Async modda sadece overlapped okuma denenir. Hata olursa fırlatılır.
                 try:
                     available_data = _read_overlapped_timeout(
                         int(self._handle),
@@ -382,7 +377,12 @@ class WindowsSyncSource(DiskSource):
                         return b""
                     return available_data[data_start:data_end]
                 except OSError:
-                    pass
+                    # Async okuma yapılandırılmışsa ve hata aldıysak, senkron okumaya DÜŞMEMELİYİZ
+                    # çünkü handle async modda açılmış olabilir ve senkron okuma beklenmedik davranabilir,
+                    # veya hata timeout kaynaklıdır ve senkron okuma sonsuza kadar bloklayabilir.
+                    raise
+
+            # --- Senkron Okuma (Sadece timeout=0 ise buraya gelir) ---
 
             # ReadFile DWORD size sınırı
             max_dword = 0xFFFFFFFF
@@ -426,6 +426,13 @@ class WindowsSyncSource(DiskSource):
 
 
 def open_windows_source(path: str, *, config: PyddeuConfig | None = None) -> DiskSource:
+    cfg = config or PyddeuConfig()
+    timeout = int(getattr(cfg, "deviowait_ms", 0) or 0)
+
+    flags = FILE_ATTRIBUTE_NORMAL
+    if timeout > 0:
+        flags |= FILE_FLAG_OVERLAPPED
+
     # FILE_FLAG_OVERLAPPED yok -> Senkron Mod (Daha güvenli)
     handle = kernel32.CreateFileW(
         path,
@@ -433,7 +440,7 @@ def open_windows_source(path: str, *, config: PyddeuConfig | None = None) -> Dis
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         None,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
+        flags,
         None,
     )
 
@@ -443,14 +450,13 @@ def open_windows_source(path: str, *, config: PyddeuConfig | None = None) -> Dis
     size = _query_size(handle)
     sector_size = _query_sector_size(handle)
 
-    cfg = config or PyddeuConfig()
     # dmde.ini: deviowait=0 disables overlapped; deviowait>0 is cancel timeout (ms).
     return WindowsSyncSource(
         path=path,
         _handle=handle,
         _size=size,
         _sector_size=sector_size,
-        _overlapped_timeout_ms=int(getattr(cfg, "deviowait_ms", 0) or 0),
+        _overlapped_timeout_ms=timeout,
     )
 
 

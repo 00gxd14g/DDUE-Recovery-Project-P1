@@ -81,19 +81,36 @@ def safe_read_granular(
         nonlocal refreshed
         winerr = getattr(e, "winerror", None)
         err = int(winerr) if winerr is not None else int(getattr(e, "errno", 0) or 0)
-        if err in (21, 55, 1117):
+        # Error codes that indicate controller/device reset:
+        # 21: device not ready, 55: resource unavailable, 1117: device request failed
+        # 1460: timeout, 87: invalid parameter (sometimes after reset)
+        if err in (21, 55, 1117, 1460, 87):
             try:
-                state.register_controller_panic(log_cb=log_cb)  # type: ignore[attr-defined]
+                state.register_controller_panic(log_cb=log_cb)
             except Exception:
                 pass
+            # Try to refresh handle ONLY ONCE, and don't fail if it times out
             if not refreshed:
                 refreshed = True
                 try:
-                    refresh = getattr(src, "refresh", None)
+                    refresh = getattr(src, "refresh_with_timeout", None)
                     if callable(refresh):
-                        refresh()
-                except Exception:
-                    pass
+                        # Use short timeout - don't block forever
+                        ok = refresh(timeout_s=2.0)
+                        if not ok and log_cb:
+                            log_cb("WARNING", "Disk handle refresh timed out; will retry on next reset.")
+                    else:
+                        # Fallback to regular refresh with try/catch
+                        refresh2 = getattr(src, "refresh", None)
+                        if callable(refresh2):
+                            try:
+                                refresh2()
+                            except Exception as re:
+                                if log_cb:
+                                    log_cb("WARNING", f"Disk handle refresh failed: {re}")
+                except Exception as outer_e:
+                    if log_cb:
+                        log_cb("WARNING", f"Disk refresh error ignored: {outer_e}")
 
     try:
         data = src.read_at(offset, size)

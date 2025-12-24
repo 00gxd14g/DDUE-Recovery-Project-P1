@@ -7,7 +7,7 @@ from typing import Callable, Optional
 
 from .io.base import DiskSource
 from .io import open_source
-from .ntfs_boot import parse_ntfs_boot_sector
+from .ntfs_boot import parse_ntfs_boot_sector, NtfsBoot
 from .scan import safe_read_granular
 from .state import RecoveryState
 from .config import PyddeuConfig
@@ -25,6 +25,9 @@ class Partition:
     scheme: str
     type_str: str
     name: str = ""
+    # Cache NTFS boot info for partitions found via Smart Scan
+    # Allows NTFS deep scan to work even if boot sector becomes unreadable
+    ntfs_boot: Optional[NtfsBoot] = None
 
     @property
     def end_offset(self) -> int:
@@ -198,21 +201,170 @@ def scan_partitions(
     log_cb: Optional[Callable[[str, str], None]] = None,
 ) -> list[Partition]:
     sector_size = src.sector_size() or DEFAULT_SECTOR_SIZE
+    disk_size = src.size() or 0
 
-    boot = safe_read_granular(src, state or _NULL_STATE, 0, sector_size, log_cb=log_cb)
-    if not _is_mbr(boot[:DEFAULT_SECTOR_SIZE]):
-        if sector_size != DEFAULT_SECTOR_SIZE:
-            boot512 = boot[:DEFAULT_SECTOR_SIZE]
-            if not _is_mbr(boot512):
-                return []
-        else:
-            return []
-    mbr_parts = _parse_mbr(boot)
-    if any("GPT Protective" in p.type_str for p in mbr_parts):
-        gpt_parts = _parse_gpt(src, state=state, log_cb=log_cb)
-        if gpt_parts:
-            return gpt_parts
-    return mbr_parts
+    # 1. Try MBR at Sector 0
+    boot = b""
+    mbr_valid = False
+    
+    # Try multiple times since Sector 0 is critical
+    for attempt in range(3):
+        boot = safe_read_granular(src, state or _NULL_STATE, 0, sector_size, log_cb=log_cb)
+        if _is_mbr(boot[:DEFAULT_SECTOR_SIZE]):
+            mbr_valid = True
+            break
+        if log_cb and attempt < 2 and not boot:
+             # Just a debug note if we plan to retry
+             pass
+
+    mbr_parts: list[Partition] = []
+    
+    if mbr_valid:
+        mbr_parts = _parse_mbr(boot)
+        # Check for GPT Protective MBR -> Go for GPT
+        if any("GPT Protective" in p.type_str for p in mbr_parts):
+            gpt_parts = _parse_gpt(src, state=state, log_cb=log_cb)
+            if gpt_parts:
+                return gpt_parts
+            # If GPT parse failed, return protective MBR entry (better than nothing)
+            return mbr_parts
+            
+        # If we found standard MBR partitions, return them
+        # BUT: if MBR table is empty (all zeros) but signature is valid, 
+        # we might want to probe anyway in case it's a "super floppy" or wiped table.
+        if mbr_parts:
+            return mbr_parts
+
+    # 2. If MBR invalid (read error) or Empty, TRY GPT Header directly at LBA 1
+    # (Some disks might have bad LBA 0 but valid LBA 1)
+    if disk_size > sector_size * 2:
+        try:
+            # We bypass _parse_gpt's protective check by calling logic manually here?
+            # actually _parse_gpt reads LBA 1.
+            gpt_parts = _parse_gpt(src, state=state, log_cb=log_cb)
+            if gpt_parts:
+                if log_cb: log_cb("INFO", "Found valid GPT despite missing/bad MBR.")
+                return gpt_parts
+        except Exception:
+            pass
+
+    # 3. Fallback: Quick Probe with Chain Probing (Smart Scan)
+    # This mimics DMDE "Found" behavior: finding one partition leads to the next.
+    if log_cb:
+        log_cb("WARNING", "Partition table not found. Starting Smart Quick Scan (Chain Probing)...")
+
+    found_parts: list[Partition] = []
+    
+    # Priority queue of LBAs to check. 
+    # We use a set for visited to avoid loops/dups.
+    # Start with standard alignments AND known common Windows partition LBAs.
+    # These are based on typical Windows partition layouts:
+    initial_lbas = [
+        63,          # Legacy DOS alignment
+        2048,        # Windows 7+ 1MB alignment (System Reserved typically starts here)
+        104448,      # Common start after 50MB System Reserved
+        206848,      # Common start after 100MB System Reserved  
+        264192,      # Another common alignment
+        326635520,   # Known from user's DMDE output
+        327680000,   # Near 160GB (common partition boundary)
+        327682048,   # Known from user's DMDE output - $Noname 03 (TARGET!)
+        409640,      # ~200MB offset
+    ]
+    
+    candidates = sorted(set(initial_lbas))
+    seen_lbas: set[int] = set()
+    
+    idx_found = 1
+    
+    while candidates:
+        lba = candidates.pop(0)
+        
+        if lba in seen_lbas:
+            continue
+        seen_lbas.add(lba)
+        
+        offset = lba * sector_size
+        if offset >= disk_size or offset < 0:
+            continue
+
+        # Read boot sector candidate
+        if log_cb:
+            log_cb("DEBUG", f"Smart Scan: probing LBA {lba} (offset {offset})")
+            
+        data = safe_read_granular(src, state or _NULL_STATE, offset, max(sector_size, 512), log_cb=None)
+        if not data:
+            continue
+            
+        found_len = 0
+        p_type = ""
+        p_name = ""
+        cached_ntfs_boot: Optional[NtfsBoot] = None
+        
+        # Check NTFS
+        parsed_ntfs = parse_ntfs_boot_sector(data)
+        if parsed_ntfs and parsed_ntfs.total_sectors > 0:
+            found_len = parsed_ntfs.volume_size_bytes
+            s_len = parsed_ntfs.total_sectors
+            p_type = "NTFS (Smart Scan)"
+            p_name = "Found NTFS"
+            cached_ntfs_boot = parsed_ntfs  # Cache for later use in deep scan
+            
+            # CHAIN: Add next partition start
+            next_lba = lba + s_len
+            if next_lba not in seen_lbas:
+                candidates.append(next_lba)
+                # Sometimes there's a 1MB alignment gap (2048 sectors)
+                # Align next_lba to 2048 boundary if not already
+                aligned_next = ((next_lba + 2047) // 2048) * 2048
+                if aligned_next != next_lba and aligned_next not in seen_lbas:
+                     candidates.append(aligned_next)
+
+        # Check FAT32
+        elif _is_fat32_boot(data[:512]):
+            fsize = _parse_fat32_size(data[:512])
+            if fsize:
+                found_len = fsize
+                s_len = fsize // sector_size
+                p_type = "FAT32 (Smart Scan)"
+                p_name = "Found FAT32"
+                
+                next_lba = lba + s_len
+                if next_lba not in seen_lbas:
+                    candidates.append(next_lba)
+
+        # Check exFAT
+        elif _is_exfat_boot(data[:512]):
+            xsize = _parse_exfat_size(data[:512])
+            if xsize:
+                found_len = xsize
+                s_len = xsize // sector_size
+                p_type = "exFAT (Smart Scan)"
+                p_name = "Found exFAT"
+                
+                next_lba = lba + s_len
+                if next_lba not in seen_lbas:
+                    candidates.append(next_lba)
+        
+        if found_len > 0:
+            # We found something valid!
+            found_parts.append(Partition(
+                index=idx_found,
+                start_offset=offset,
+                length=found_len,
+                scheme="FOUND",
+                type_str=p_type,
+                name=p_name,
+                ntfs_boot=cached_ntfs_boot,  # Save cached NTFS boot info
+            ))
+            idx_found += 1
+            # Sort candidates to prioritize lower LBAs (sequential scan)
+            candidates.sort()
+
+    if found_parts:
+        if log_cb: log_cb("INFO", f"Smart Quick Scan found {len(found_parts)} partition(s).")
+        return found_parts
+
+    return []
 
 
 def carve_ntfs_partitions(
@@ -374,11 +526,21 @@ def carve_ntfs_partitions(
                     state.register_error(offset, max(1, base_len))
                 success_streak = 0
                 current_chunk = max(min_chunk, current_chunk // 2)
-                step = base_len
+                # KRITIK: Hata durumunda minimum 1MB atlama garantisi
+                # Aksi takdirde aynı offset'te sonsuz döngüye giriyor
+                min_skip = max(1024 * 1024, base_len)  # En az 1MB atla
+                step = min_skip
                 if state:
-                    step = max(step, int(getattr(state, "skip_size", 0) or 0))
+                    state_skip = int(getattr(state, "skip_size", 0) or 0)
+                    # Ardişik hatalarda daha agresif atlama (büyükten küçüğe kontrol)
+                    if state.consecutive_errors >= 5:
+                        step = max(step, state_skip, 16 * 1024 * 1024)  # 16MB minimum
+                    elif state.consecutive_errors >= 3:
+                        step = max(step, state_skip, 4 * 1024 * 1024)  # 4MB minimum
+                    else:
+                        step = max(step, state_skip)
                 if log_cb:
-                    log_cb("WARNING", f"Carve read error; chunk reduced to {current_chunk // (1024 * 1024)}MB")
+                    log_cb("WARNING", f"Carve read error @ {offset}; skipping {step // (1024 * 1024)}MB, chunk={current_chunk // (1024 * 1024)}MB")
                 offset += step
                 continue
 
@@ -530,9 +692,19 @@ def carve_exfat_partitions(
                     state.register_error(offset, max(1, base_len))
                 success_streak = 0
                 current_chunk = max(min_chunk, current_chunk // 2)
-                step = base_len
+                # KRITIK: Hata durumunda minimum 1MB atlama garantisi
+                min_skip = max(1024 * 1024, base_len)
+                step = min_skip
                 if state:
-                    step = max(step, int(getattr(state, "skip_size", 0) or 0))
+                    state_skip = int(getattr(state, "skip_size", 0) or 0)
+                    if state.consecutive_errors >= 5:
+                        step = max(step, state_skip, 16 * 1024 * 1024)
+                    elif state.consecutive_errors >= 3:
+                        step = max(step, state_skip, 4 * 1024 * 1024)
+                    else:
+                        step = max(step, state_skip)
+                if log_cb:
+                    log_cb("WARNING", f"exFAT carve read error @ {offset}; skipping {step // (1024 * 1024)}MB")
                 offset += step
                 continue
 
@@ -683,9 +855,19 @@ def carve_fat32_partitions(
                     state.register_error(offset, max(1, base_len))
                 success_streak = 0
                 current_chunk = max(min_chunk, current_chunk // 2)
-                step = base_len
+                # KRITIK: Hata durumunda minimum 1MB atlama garantisi
+                min_skip = max(1024 * 1024, base_len)
+                step = min_skip
                 if state:
-                    step = max(step, int(getattr(state, "skip_size", 0) or 0))
+                    state_skip = int(getattr(state, "skip_size", 0) or 0)
+                    if state.consecutive_errors >= 5:
+                        step = max(step, state_skip, 16 * 1024 * 1024)
+                    elif state.consecutive_errors >= 3:
+                        step = max(step, state_skip, 4 * 1024 * 1024)
+                    else:
+                        step = max(step, state_skip)
+                if log_cb:
+                    log_cb("WARNING", f"FAT32 carve read error @ {offset}; skipping {step // (1024 * 1024)}MB")
                 offset += step
                 continue
 

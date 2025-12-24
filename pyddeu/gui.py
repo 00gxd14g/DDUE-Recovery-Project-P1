@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import struct
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,7 +20,7 @@ else:
     _PYTSK3_IMPORT_ERROR = None
 
 from .io import list_sources, open_source
-from .mft import build_paths, scan_and_parse_mft
+from .mft import build_paths, scan_and_parse_mft, parse_mft_record_best_effort
 from .partitions import (
     Partition,
     carve_exfat_partitions,
@@ -143,6 +144,11 @@ class PyDDEUGui:
         actions_menu.add_command(label="Recover All (Zero-fill)", command=self.action_recover_all)
         actions_menu.add_command(label="Recover All (MFT)", command=self.action_recover_all_mft)
         actions_menu.add_separator()
+        actions_menu.add_command(label="Select Missing Files", command=self.action_select_missing)
+        actions_menu.add_command(label="Recover Selected", command=self.action_recover_selected)
+        actions_menu.add_command(label="Select All", command=self.action_select_all)
+        actions_menu.add_command(label="Clear Selection", command=self.action_clear_selection)
+        actions_menu.add_separator()
         actions_menu.add_command(label="Create Image", command=self.action_create_image)
         actions_menu.add_command(label="Image Selected Part", command=self.action_image_selected_partition)
 
@@ -171,7 +177,7 @@ class PyDDEUGui:
         paned.add(right_frame, weight=3)
 
         cols = ("size", "status", "inode")
-        self.tree = ttk.Treeview(right_frame, columns=cols, show="tree headings")
+        self.tree = ttk.Treeview(right_frame, columns=cols, show="tree headings", selectmode="extended")
         self.tree.heading("#0", text="Path")
         self.tree.heading("size", text="Size (B)")
         self.tree.heading("status", text="Status")
@@ -252,6 +258,10 @@ class PyDDEUGui:
         filter_opts_menu.add_separator()
         filter_opts_menu.add_checkbutton(label="Include Deleted", variable=self.var_export_deleted)
         filter_opts_menu.add_checkbutton(label="Include Active", variable=self.var_export_active)
+
+        # Missing files selection buttons
+        ttk.Button(filter_frame, text="Select Missing", command=self.action_select_missing).pack(side=tk.LEFT, padx=(15, 2))
+        ttk.Button(filter_frame, text="Recover Selected", command=self.action_recover_selected).pack(side=tk.LEFT, padx=2)
 
     def _log(self, level: str, msg: str) -> None:
         self.log_queue.put((level, msg))
@@ -766,6 +776,8 @@ class PyDDEUGui:
 
         self.tree.delete(*self.tree.get_children())
         self.node_metadata = {}
+        self._folder_cache = {}
+        self._full_path_cache = {}
         self.state.stop_requested = False
 
         def log_cb(level: str, msg: str) -> None:
@@ -814,6 +826,8 @@ class PyDDEUGui:
         self.node_metadata = {}
         self._resident_cache = {}
         self._nonresident_cache = {}
+        self._folder_cache = {}
+        self._full_path_cache = {}
 
         def log_cb(level: str, msg: str) -> None:
             self._log(level, msg)
@@ -824,8 +838,16 @@ class PyDDEUGui:
             self._status_text = f"{prefix}Deep NTFS scan (MFT)..."
             self._status_pct = 0
             src = open_source(self.source_path, config=self.config)
-            boot_buf = src.read_at(part.start_offset, 512)
-            boot = parse_ntfs_boot_sector(boot_buf)
+            
+            # Try to use cached NtfsBoot from partition (obtained during Smart Scan)
+            boot = part.ntfs_boot
+            if boot:
+                self._log("INFO", "Using cached NTFS boot info from Smart Scan.")
+            else:
+                # Fall back to reading boot sector from disk
+                boot_buf = src.read_at(part.start_offset, 512)
+                boot = parse_ntfs_boot_sector(boot_buf)
+                
             if not boot:
                 self._log("CRITICAL", "Selected partition does not look like NTFS boot sector.")
                 self._status_text = "Deep scan failed"
@@ -840,21 +862,143 @@ class PyDDEUGui:
                     self._status_pct = int(min(99, (off / total) * 100))
 
             collected = []
-            for rec in scan_and_parse_mft(
-                src,
-                self.state,
-                start=part.start_offset,
-                end=part.start_offset + boot.volume_size_bytes,
-                step=4096,
-                record_size=boot.file_record_size,
-                log_cb=log_cb,
-                progress_cb=progress,
-            ):
-                if self.state.stop_requested:
-                    break
-                collected.append(rec)
-                if len(collected) % 500 == 0:
-                    self._log("INFO", f"Deep scan parsed records: {len(collected)}")
+            
+            # SMART APPROACH: Try reading MFT directly at known location first
+            mft_offset = part.start_offset + (boot.mft_lcn * cluster_size)
+            self._log("INFO", f"Trying direct MFT read at offset {mft_offset} (LCN {boot.mft_lcn})")
+            
+            # Read the first MFT record ($MFT itself) which contains the data runs for the entire MFT
+            from .scan import safe_read_granular
+            from .mft import _decode_runlist_to_lcns
+            
+            mft_record0 = safe_read_granular(src, self.state, mft_offset, boot.file_record_size, log_cb=log_cb)
+            
+            mft_accessible = mft_record0 and len(mft_record0) >= 4 and mft_record0[:4] == b"FILE"
+            
+            if mft_accessible:
+                self._log("INFO", "MFT is accessible! Parsing $MFT data runs for fragmented MFT support...")
+                
+                # Parse $MFT record to get its data runs (MFT can be fragmented!)
+                mft_runs = []
+                try:
+                    # Find $DATA attribute (0x80) in $MFT record
+                    attr_off = struct.unpack_from("<H", mft_record0, 20)[0]
+                    off = attr_off
+                    while off + 16 <= len(mft_record0):
+                        attr_type = struct.unpack_from("<I", mft_record0, off)[0]
+                        if attr_type == 0xFFFFFFFF:
+                            break
+                        attr_len = struct.unpack_from("<I", mft_record0, off + 4)[0]
+                        if attr_len <= 0 or off + attr_len > len(mft_record0):
+                            break
+                        non_res = mft_record0[off + 8]
+                        
+                        if attr_type == 0x80 and non_res == 1:  # Non-resident $DATA
+                            run_off = struct.unpack_from("<H", mft_record0, off + 32)[0]
+                            runlist = mft_record0[off + run_off : off + attr_len]
+                            mft_runs = _decode_runlist_to_lcns(runlist)
+                            self._log("INFO", f"Found {len(mft_runs)} MFT data runs")
+                            break
+                        off += attr_len
+                except Exception as e:
+                    self._log("WARNING", f"Failed to parse $MFT data runs: {e}")
+                
+                max_records = 500000  # Safety limit for large volumes
+                mft_record_num = 0  # Actual MFT record index (inode)
+                
+                if mft_runs:
+                    # Read MFT following the data runs (fragmented MFT support)
+                    for run_idx, (lcn, length_clusters) in enumerate(mft_runs):
+                        if self.state.stop_requested:
+                            break
+                        if lcn is None:
+                            # Sparse run, skip but still count records for proper inode numbering
+                            sparse_records = (length_clusters * cluster_size) // boot.file_record_size
+                            mft_record_num += sparse_records
+                            continue
+                            
+                        run_offset = part.start_offset + (lcn * cluster_size)
+                        run_size = length_clusters * cluster_size
+                        records_in_run = run_size // boot.file_record_size
+                        
+                        self._log("DEBUG", f"Reading MFT run {run_idx}: LCN={lcn}, {records_in_run} records (starting at inode {mft_record_num})")
+                        
+                        for i in range(records_in_run):
+                            if self.state.stop_requested or mft_record_num >= max_records:
+                                break
+                                
+                            offset = run_offset + (i * boot.file_record_size)
+                            rec_data = safe_read_granular(src, self.state, offset, boot.file_record_size, log_cb=None)
+                            
+                            if not rec_data or len(rec_data) < boot.file_record_size:
+                                mft_record_num += 1
+                                continue
+                            if rec_data[:4] != b"FILE":
+                                mft_record_num += 1
+                                continue
+                                
+                            # Pass the actual MFT record number for proper inode assignment
+                            summary = parse_mft_record_best_effort(
+                                rec_data, 
+                                record_offset=offset,
+                                mft_record_number=mft_record_num
+                            )
+                            if summary and (summary.file_names or summary.resident_data is not None):
+                                collected.append(summary)
+                                
+                            mft_record_num += 1
+                            
+                            if mft_record_num % 1000 == 0:
+                                self._log("INFO", f"MFT scan progress: {mft_record_num} records scanned, {len(collected)} with filenames")
+                                progress(mft_record_num, max_records)
+                else:
+                    # No data runs found, try sequential reading (small MFT)
+                    self._log("WARNING", "No MFT data runs found, trying sequential read...")
+                    offset = mft_offset
+                    while mft_record_num < max_records:
+                        if self.state.stop_requested:
+                            break
+                            
+                        rec_data = safe_read_granular(src, self.state, offset, boot.file_record_size, log_cb=None)
+                        if not rec_data or len(rec_data) < boot.file_record_size:
+                            break
+                        if rec_data[:4] != b"FILE":
+                            break
+                            
+                        summary = parse_mft_record_best_effort(
+                            rec_data, 
+                            record_offset=offset,
+                            mft_record_number=mft_record_num
+                        )
+                        if summary and (summary.file_names or summary.resident_data is not None):
+                            collected.append(summary)
+                            
+                        mft_record_num += 1
+                        offset += boot.file_record_size
+                        
+                        if mft_record_num % 500 == 0:
+                            self._log("INFO", f"Direct MFT scan parsed records: {len(collected)}")
+                            progress(mft_record_num, max_records)
+                            
+                self._log("INFO", f"MFT scan complete: {len(collected)} files found in {mft_record_num} records")
+            else:
+                self._log("WARNING", "MFT not accessible at expected location. Falling back to brute-force scan...")
+                # Fallback to original behavior: scan entire partition for FILE signatures
+                for rec in scan_and_parse_mft(
+                    src,
+                    self.state,
+                    start=part.start_offset,
+                    end=part.start_offset + boot.volume_size_bytes,
+                    step=4096,
+                    record_size=boot.file_record_size,
+                    log_cb=log_cb,
+                    progress_cb=progress,
+                ):
+                    if self.state.stop_requested:
+                        break
+                    collected.append(rec)
+                    if len(collected) % 500 == 0:
+                        self._log("INFO", f"Deep scan parsed records: {len(collected)}")
 
             paths = build_paths(collected)
             for rec in collected:
@@ -898,6 +1042,8 @@ class PyDDEUGui:
         self.tree.delete(*self.tree.get_children())
         self.node_metadata = {}
         self._resident_cache = {}
+        self._folder_cache = {}
+        self._full_path_cache = {}
 
         def log_cb(level: str, msg: str) -> None:
             self._log(level, msg)
@@ -1022,8 +1168,57 @@ class PyDDEUGui:
                 continue
 
     def _ui_add_tree_item(self, item: _TreeItem) -> None:
-        node_id = self.tree.insert("", "end", text=item.path, values=(item.size, item.status, item.inode))
+        """
+        Dosya yöneticisi benzeri hiyerarşik TreeView oluşturur.
+        Path'i parçalara ayırır ve klasör yapısını oluşturur.
+        """
+        # Normalize path
+        path_text = item.path.replace("\\", "/").strip("/")
+        
+        # Remove prefixes like [DEEP], [MFT]
+        for prefix in ("[DEEP] ", "[MFT] ", "[DEEP]", "[MFT]"):
+            if path_text.startswith(prefix):
+                path_text = path_text[len(prefix):].strip("/")
+                break
+        
+        if not path_text:
+            path_text = f"inode_{item.inode}"
+        
+        parts = [p.strip() for p in path_text.split("/") if p.strip()]
+        if not parts:
+            parts = [f"inode_{item.inode}"]
+        
+        # Build hierarchical structure
+        parent_id = ""
+        current_path = ""
+        
+        # Create/find parent folders
+        for i, part in enumerate(parts[:-1]):
+            current_path = f"{current_path}/{part}" if current_path else part
+            folder_key = f"folder:{current_path}"
+            
+            # Check if folder already exists in our cache
+            if not hasattr(self, "_folder_cache"):
+                self._folder_cache: dict[str, str] = {}
+            
+            if folder_key in self._folder_cache:
+                parent_id = self._folder_cache[folder_key]
+            else:
+                # Create folder node
+                folder_id = self.tree.insert(parent_id, "end", text=part, values=("", "FOLDER", ""), open=False)
+                self._folder_cache[folder_key] = folder_id
+                parent_id = folder_id
+        
+        # Add the actual file/item
+        file_name = parts[-1] if parts else f"inode_{item.inode}"
+        node_id = self.tree.insert(parent_id, "end", text=file_name, values=(item.size, item.status, item.inode))
         self.node_metadata[node_id] = (item.part_offset, item.inode, item.is_dir)
+        
+        # Store full path for recovery
+        if not hasattr(self, "_full_path_cache"):
+            self._full_path_cache: dict[str, str] = {}
+        self._full_path_cache[node_id] = path_text
+        
         if item.resident_data:
             self._resident_cache[node_id] = item.resident_data
         if item.data_runs and item.cluster_size:
@@ -1717,6 +1912,250 @@ class PyDDEUGui:
             if not cand.exists():
                 return cand
             i += 1
+
+    def action_select_missing(self) -> None:
+        """
+        Hedef klasörde bulunmayan (henüz kurtarılmamış) dosyaları seçer.
+        Bu sayede kullanıcı sadece eksik dosyaları görebilir ve kurtarabilir.
+        """
+        try:
+            self.output_root = Path(self.entry_output.get().strip())
+        except Exception:
+            pass
+        if not self.output_root:
+            messagebox.showerror("Select Missing", "Önce bir çıktı klasörü seçin.")
+            return
+
+        # Recursive function to get all leaf nodes (files, not folders)
+        def get_all_file_nodes(parent: str = "") -> list[str]:
+            nodes = []
+            children = self.tree.get_children(parent)
+            for child in children:
+                # Check if it's a folder (has children) or a file
+                sub_children = self.tree.get_children(child)
+                if sub_children:
+                    nodes.extend(get_all_file_nodes(child))
+                else:
+                    # It's a file (leaf node)
+                    if self.node_metadata.get(child):
+                        nodes.append(child)
+            return nodes
+
+        all_files = get_all_file_nodes()
+        if not all_files:
+            messagebox.showinfo("Select Missing", "Listede dosya yok.")
+            return
+
+        # Clear current selection
+        self.tree.selection_remove(*self.tree.selection())
+
+        missing_count = 0
+        ext_set = _parse_ext_filter(self.entry_ext.get())
+        max_bytes = _parse_max_mb(self.entry_max_mb.get())
+        skip_archives = bool(self.var_skip_archives.get())
+        include_deleted = bool(self.var_export_deleted.get())
+        include_active = bool(self.var_export_active.get())
+
+        missing_nodes = []
+        for node_id in all_files:
+            try:
+                meta = self.node_metadata.get(node_id)
+                if not meta:
+                    continue
+                part_offset, inode, is_dir = meta
+                if is_dir:
+                    continue
+
+                # Apply filters
+                status = str(self.tree.set(node_id, "status") or "")
+                if status == "DELETED" and not include_deleted:
+                    continue
+                if status == "ACTIVE" and not include_active:
+                    continue
+
+                # Get full path from cache, or fallback to tree item text
+                rel = self._full_path_cache.get(node_id) if hasattr(self, "_full_path_cache") else None
+                if not rel:
+                    item_text = self.tree.item(node_id, "text")
+                    rel = _normalize_rel_path(item_text) or f"inode_{inode}"
+                
+                file_size = _get_tree_size(self.tree, node_id)
+                if max_bytes > 0 and file_size > max_bytes:
+                    continue
+                if skip_archives and _is_archive_path(rel):
+                    continue
+                if ext_set and not _ext_allowed(rel, ext_set):
+                    continue
+
+                # Check if file exists in destination
+                target = self.output_root / rel
+                if not _should_skip_existing(target, file_size):
+                    missing_nodes.append(node_id)
+                    missing_count += 1
+            except Exception:
+                continue
+
+        if missing_nodes:
+            self.tree.selection_set(missing_nodes)
+            # Scroll to first missing item
+            self.tree.see(missing_nodes[0])
+            
+        self._log("INFO", f"Eksik dosya sayısı: {missing_count} / {len(all_files)}")
+        messagebox.showinfo("Select Missing", f"{missing_count} eksik dosya seçildi.\n\n'Recover Selected' ile kurtarabilirsiniz.")
+
+    def action_recover_selected(self) -> None:
+        """
+        Seçili dosyaları kurtarır.
+        """
+        sel = list(self.tree.selection())
+        if not sel:
+            messagebox.showwarning("Recover Selected", "Önce dosya seçin.\n\n'Select Missing' ile eksik dosyaları seçebilirsiniz.")
+            return
+
+        try:
+            self.output_root = Path(self.entry_output.get().strip())
+        except Exception:
+            pass
+        if not self.output_root:
+            messagebox.showerror("Recover Selected", "Önce bir çıktı klasörü seçin.")
+            return
+
+        if not self.source:
+            messagebox.showerror("Recover Selected", "Önce bir disk/imaj bağlayın.")
+            return
+
+        # Filter out directories
+        valid_items = []
+        for node_id in sel:
+            meta = self.node_metadata.get(node_id)
+            if meta:
+                part_offset, inode, is_dir = meta
+                if not is_dir:
+                    valid_items.append(node_id)
+
+        if not valid_items:
+            messagebox.showinfo("Recover Selected", "Geçerli dosya seçilmedi (klasörler atlanıyor).")
+            return
+
+        confirm = messagebox.askyesno(
+            "Recover Selected",
+            f"{len(valid_items)} dosya kurtarılacak.\n\nDevam etmek istiyor musunuz?"
+        )
+        if not confirm:
+            return
+
+        self.state.stop_requested = False
+        self._status_text = "Seçili dosyalar kurtarılıyor..."
+        self._status_pct = 0
+
+        def worker() -> None:
+            exported = 0
+            skipped = 0
+            errors = 0
+            total = len(valid_items)
+            src = None
+
+            try:
+                src = open_source(self.source_path, config=self.config)
+                img = DDEUImg(src, self.state, log_cb=self._log)
+                exporter_cache: dict[int, RobustExporter] = {}
+
+                for idx, node_id in enumerate(valid_items, start=1):
+                    if self.state.stop_requested or not self.state.is_alive:
+                        self._log("WARNING", "Kurtarma işlemi durduruldu.")
+                        break
+
+                    try:
+                        meta = self.node_metadata.get(node_id)
+                        if not meta:
+                            skipped += 1
+                            continue
+
+                        part_offset, inode, is_dir = meta
+                        
+                        # Get full path from cache, or fallback to tree item text
+                        rel = self._full_path_cache.get(node_id) if hasattr(self, "_full_path_cache") else None
+                        if not rel:
+                            item_text = self.tree.item(node_id, "text")
+                            rel = _normalize_rel_path(item_text) or f"inode_{inode}"
+                        
+                        target = self.output_root / rel
+                        target.parent.mkdir(parents=True, exist_ok=True)
+
+                        # Update status
+                        self._status_text = f"Kurtarılıyor: {Path(rel).name} ({idx}/{total})"
+                        self._status_pct = int((idx / total) * 100)
+
+                        # Try resident data first
+                        resident = self._resident_cache.get(node_id)
+                        if resident is not None:
+                            target.write_bytes(resident)
+                            exported += 1
+                            self._log("INFO", f"Kurtarıldı (resident): {target}")
+                            continue
+
+                        # Try non-resident data runs
+                        nonres = self._nonresident_cache.get(node_id)
+                        if nonres is not None:
+                            part_off2, cluster_size, runs, expected = nonres
+                            recover_nonresident_runs(
+                                src,
+                                self.state,
+                                target,
+                                part_offset=part_off2,
+                                cluster_size=cluster_size,
+                                runs=runs,
+                                expected_size=expected,
+                                log_cb=self._log,
+                            )
+                            exported += 1
+                            self._log("INFO", f"Kurtarıldı (non-resident): {target}")
+                            continue
+
+                        # Fall back to pytsk3 export
+                        exporter = exporter_cache.get(int(part_offset))
+                        if exporter is None:
+                            fs = pytsk3.FS_Info(img, offset=int(part_offset))
+                            exporter = RobustExporter(fs, self.state, log_cb=self._log)
+                            exporter_cache[int(part_offset)] = exporter
+
+                        ok = exporter.export_inode(inode, target)
+                        if ok:
+                            exported += 1
+                            self._log("INFO", f"Kurtarıldı: {target}")
+                        else:
+                            errors += 1
+                            self._log("WARNING", f"Kurtarılamadı: {rel}")
+
+                    except Exception as e:
+                        errors += 1
+                        self._log("ERROR", f"Kurtarma hatası ({node_id}): {e}")
+
+            except Exception as e:
+                self._log("CRITICAL", f"Kurtarma işlemi başarısız: {e}")
+            finally:
+                try:
+                    if src is not None:
+                        src.close()
+                except Exception:
+                    pass
+                self._log("INFO", f"=== TAMAMLANDI === Başarılı: {exported}, Atlanan: {skipped}, Hatalı: {errors}")
+                self._status_text = f"Kurtarma tamamlandı (ok={exported} err={errors})"
+                self._status_pct = 100
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def action_select_all(self) -> None:
+        """Tüm dosyaları seçer."""
+        items = self.tree.get_children("")
+        if items:
+            self.tree.selection_set(items)
+            self._log("INFO", f"{len(items)} öğe seçildi.")
+
+    def action_clear_selection(self) -> None:
+        """Tüm seçimi temizler."""
+        self.tree.selection_remove(*self.tree.selection())
+        self._log("INFO", "Seçim temizlendi.")
 
 
 def _normalize_rel_path(item_text: str) -> str:

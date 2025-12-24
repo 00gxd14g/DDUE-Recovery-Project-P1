@@ -197,16 +197,28 @@ class RecoveryState:
     def register_controller_panic(self, log_cb: Optional[LogCb] = None) -> None:
         """
         Called when OS logs indicate a device reset/controller panic.
-        We do NOT auto-stop; instead we pause reads with exponential backoff to avoid a reset loop.
+        After too many panics, we auto-stop to prevent infinite loops.
         """
         with self._lock:
-            self._panic_level = min(self._panic_level + 1, 10)
-            # Be aggressive: long pauses can make UI-based carving look "stuck".
-            pause_s = min(10.0, 1.0 * (1.5 ** self._panic_level))
+            self._panic_level = min(self._panic_level + 1, 15)
+            # Daha agresif bekleme: her panic'te bekleme süresini artır
+            # İlk panic: 2s, sonra 3s, 4.5s, 6.75s... max 30s
+            pause_s = min(30.0, 2.0 * (1.5 ** (self._panic_level - 1)))
             self.pause_until = max(self.pause_until, time.time() + pause_s)
+            
+            # Çok fazla panic olduysa otomatik durdur
+            if self._panic_level >= 10:
+                self.stop_requested = True
+                if log_cb:
+                    try:
+                        log_cb("CRITICAL", f"Too many controller panics ({self._panic_level}). Auto-stopping to prevent system hang.")
+                    except Exception:
+                        pass
+                return
+        
         if log_cb:
             try:
-                log_cb("WARNING", f"Controller Panic detected! Pausing for {pause_s:.1f} seconds.")
+                log_cb("WARNING", f"Controller Panic #{self._panic_level} detected! Pausing for {pause_s:.1f} seconds.")
             except Exception:
                 pass
 
