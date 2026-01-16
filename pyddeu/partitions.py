@@ -381,8 +381,50 @@ def scan_partitions(
             candidates.sort()
 
     if found_parts:
-        if log_cb: log_cb("INFO", f"Smart Quick Scan found {len(found_parts)} partition(s).")
-        return found_parts
+        # DMDE-style extra: if a very large NTFS volume overlaps another found start,
+        # add a "bounded" variant ending at the next start (matches DMDE's dual listings).
+        starts = sorted({int(p.start_offset // DEFAULT_SECTOR_SIZE) for p in found_parts if p.start_offset >= 0})
+        by_start: dict[int, Partition] = {}
+        for p in found_parts:
+            by_start.setdefault(int(p.start_offset), p)
+
+        augmented = list(found_parts)
+        min_large_bytes = 1024 * 1024 * 1024  # 1GB
+        for p in found_parts:
+            if "NTFS" not in str(p.type_str or "").upper():
+                continue
+            if int(p.length) < min_large_bytes:
+                continue
+            start_lba = int(p.start_offset // DEFAULT_SECTOR_SIZE)
+            end_lba = start_lba + int(p.length // DEFAULT_SECTOR_SIZE) - 1
+            inner = [s for s in starts if s > start_lba and s <= end_lba]
+            if not inner:
+                continue
+            next_start = min(inner)
+            bounded_len = int(max(0, (next_start - start_lba) * DEFAULT_SECTOR_SIZE))
+            if bounded_len <= 0 or bounded_len >= int(p.length):
+                continue
+            augmented.append(
+                Partition(
+                    index=int(p.index) + 1000,
+                    start_offset=int(p.start_offset),
+                    length=bounded_len,
+                    scheme=str(p.scheme),
+                    type_str=str(p.type_str) + " (bounded)",
+                    name=str(p.name),
+                    ntfs_boot=p.ntfs_boot,
+                )
+            )
+
+        augmented.sort(key=lambda pp: int(pp.start_offset))
+        if log_cb:
+            log_cb("INFO", f"Smart Quick Scan found {len(found_parts)} partition(s).")
+            for p in augmented:
+                lba0 = int(p.start_offset // DEFAULT_SECTOR_SIZE)
+                lba1 = int((p.start_offset + max(0, p.length)) // DEFAULT_SECTOR_SIZE - 1) if p.length > 0 else lba0
+                gb = float(p.length) / (1024**3) if p.length > 0 else 0.0
+                log_cb("INFO", f"FOUND: {p.type_str} LBA {lba0}..{lba1} ({gb:.2f} GB)")
+        return augmented
 
     return []
 
