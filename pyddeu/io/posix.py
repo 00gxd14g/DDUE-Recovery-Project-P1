@@ -116,21 +116,23 @@ def _query_sector_size(fd: int, retries: int = 3) -> int:
     """
     Query device sector size using ioctl.
 
-    Tries physical sector size first, then logical sector size.
-    Returns 512 as default if queries fail.
+    Returns the *logical* sector size (LBA size) used by partition tables.
+
+    Note: Many USB SSD enclosures report 4K physical sectors (512e). Partition
+    tables still use 512-byte LBAs, so we must prefer BLKSSZGET.
     """
     import fcntl
 
-    # Try physical sector size first (more accurate for 4K drives)
+    # Prefer logical sector size (LBA size).
     buf = bytearray(4)
-    if _ioctl_with_retry(fd, BLKPBSZGET, buf, retries):
+    if _ioctl_with_retry(fd, BLKSSZGET, buf, retries):
         size = struct.unpack("<I", buf)[0]
         if size in (512, 1024, 2048, 4096):
             return size
 
-    # Fall back to logical sector size
+    # Fall back to physical sector size if logical is unavailable.
     buf = bytearray(4)
-    if _ioctl_with_retry(fd, BLKSSZGET, buf, retries):
+    if _ioctl_with_retry(fd, BLKPBSZGET, buf, retries):
         size = struct.unpack("<I", buf)[0]
         if size in (512, 1024, 2048, 4096):
             return size

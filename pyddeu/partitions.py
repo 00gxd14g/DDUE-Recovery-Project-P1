@@ -263,6 +263,7 @@ def scan_partitions(
     initial_lbas = [
         63,          # Legacy DOS alignment
         2048,        # Windows 7+ 1MB alignment (System Reserved typically starts here)
+        2952,        # Alternate NTFS boot candidate seen on some disks (DMDE may list)
         104448,      # Common start after 50MB System Reserved
         206848,      # Common start after 100MB System Reserved  
         264192,      # Another common alignment
