@@ -423,12 +423,66 @@ class PyDDEUGui:
         if not parts:
             return None
 
-        def score(p: Partition) -> tuple[int, int]:
+        src = getattr(self, "source", None)
+        disk_size = 0
+        try:
+            disk_size = int(src.size() or 0) if src is not None else 0
+        except Exception:
+            disk_size = 0
+
+        # Work in 512-byte LBA units for DMDE-like comparisons.
+        def lba_of(p: Partition) -> int:
+            return int(int(p.start_offset) // 512)
+
+        def clamp_len(p: Partition) -> int:
+            base = max(0, int(p.length))
+            if disk_size <= 0:
+                return base
+            start = max(0, int(p.start_offset))
+            return min(base, max(0, disk_size - start))
+
+        ntfs_parts = [p for p in parts if "NTFS" in str(p.type_str or "").upper()]
+        candidates = ntfs_parts or list(parts)
+
+        # Prefer the largest "data" partition using span-to-next-large-start to avoid
+        # "last writer wins" and avoid small recovery/reserved partitions.
+        big_threshold = 4 * 1024 * 1024 * 1024  # 4GB
+        big = [p for p in candidates if clamp_len(p) >= big_threshold]
+        span_basis = big or candidates
+        starts_sorted = sorted({lba_of(p) for p in span_basis})
+
+        def span_len(p: Partition) -> int:
+            if not starts_sorted:
+                return clamp_len(p)
+            start_lba = lba_of(p)
+            nxt = None
+            for s in starts_sorted:
+                if s > start_lba:
+                    nxt = s
+                    break
+            if nxt is not None:
+                return int(max(0, (nxt - start_lba) * 512))
+            if disk_size > 0:
+                return int(max(0, disk_size - int(p.start_offset)))
+            return clamp_len(p)
+
+        def score(p: Partition) -> tuple[int, int, int, int]:
             t = str(p.type_str or "").upper()
             is_ntfs = 1 if "NTFS" in t else 0
-            return (is_ntfs, int(p.length))
+            eff = span_len(p)
+            clen = clamp_len(p)
+            # Prefer earlier starts on ties (more likely OS/data).
+            return (is_ntfs, eff, clen, -int(p.start_offset))
 
-        return max(parts, key=score)
+        chosen = max(candidates, key=score)
+        try:
+            self._log(
+                "INFO",
+                f"Auto-selected partition: LBA={lba_of(chosen)} size={(clamp_len(chosen) / (1024**3)):.2f}GB ({chosen.type_str})",
+            )
+        except Exception:
+            pass
+        return chosen
 
     def _run_parse_fs(self, part: Partition, *, label: str = "") -> bool:
         if pytsk3 is None:
