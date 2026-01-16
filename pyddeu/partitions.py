@@ -14,7 +14,9 @@ from .state import RecoveryState
 from .config import PyddeuConfig
 
 
-DEFAULT_SECTOR_SIZE = 512
+# DMDE/MBR/GPT "LBA" addressing is always 512 bytes, even on 4K devices.
+LBA_SIZE = 512
+DEFAULT_SECTOR_SIZE = LBA_SIZE
 _MBR_SIG = b"\x55\xAA"
 
 
@@ -366,7 +368,14 @@ def scan_partitions(
     ]
     preferred_starts = set(initial_lbas)
     
-    candidates = sorted(set(initial_lbas))
+    # Probe around known starts as well: many NTFS backup boot sectors sit at (next_start - 1).
+    seed: set[int] = set()
+    for base in initial_lbas:
+        for delta in (-1, 0, 1):
+            v = int(base + delta)
+            if v >= 0:
+                seed.add(v)
+    candidates = sorted(seed)
     seen_lbas: set[int] = set()
     
     idx_found = 1
@@ -428,6 +437,10 @@ def scan_partitions(
                 aligned_next = ((next_lba + 2047) // 2048) * 2048
                 if aligned_next != next_lba and aligned_next not in seen_lbas:
                      candidates.append(aligned_next)
+                # Also probe around the boundary (end sector / off-by-one / backup boot).
+                for adj in (next_lba - 1, next_lba + 1):
+                    if adj >= 0 and adj not in seen_lbas:
+                        candidates.append(adj)
 
         # Check FAT32
         elif _is_fat32_boot(data[:512]):

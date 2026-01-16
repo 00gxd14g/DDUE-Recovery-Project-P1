@@ -564,6 +564,7 @@ class PyDDEUGui:
             self._log(level, msg)
 
         src = None
+        err: Exception | None = None
         try:
             prefix = f"{label} - " if label else ""
             self._status_text = f"{prefix}Parsing filesystem via pytsk3…"
@@ -578,16 +579,29 @@ class PyDDEUGui:
             self._status_pct = 100
             return True
         except Exception as e:
-            self._log("CRITICAL", f"Filesystem parse failed: {e}")
-            self._status_text = "Filesystem parse failed"
-            self._status_pct = None
-            return False
+            err = e
         finally:
             try:
                 if src:
                     src.close()
             except Exception:
                 pass
+
+        # Error path: if this is NTFS but the primary boot is damaged, fall back to
+        # DMDE-style recovery via backup boot + manual MFT parsing.
+        prefix = f"{label} - " if label else ""
+        if err is not None:
+            self._log("CRITICAL", f"Filesystem parse failed: {err}")
+        self._status_text = "Filesystem parse failed"
+        self._status_pct = None
+
+        t = str(part.type_str or "").upper()
+        if "NTFS" in t or getattr(part, "ntfs_boot", None) is not None:
+            self._log("WARNING", f"{prefix}Falling back to Deep NTFS scan (MFT) due to mount failure.")
+            found = self._run_deep_ntfs_scan(part, label=(label or "Manual") + " Fallback")
+            return found > 0
+
+        return False
 
     def _run_raw_carve(self, *, label: str = "") -> int:
         try:
@@ -959,22 +973,7 @@ class PyDDEUGui:
             self._log(level, msg)
 
         def worker() -> None:
-            try:
-                self._status_text = "Parsing filesystem via pytsk3…"
-                self._status_pct = None
-                src = open_source(self.source_path, config=self.config)
-                img = DDEUImg(src, self.state, log_cb=log_cb)
-                fs, fs_offset = self._open_fs_smart(img, src, int(part.start_offset), label="Manual")
-                root_dir = fs.open_dir(path="/")
-                self._walk_dir(root_dir, "", int(fs_offset))
-                src.close()
-                self._log("INFO", "Filesystem parse completed.")
-                self._status_text = "Filesystem parse done"
-                self._status_pct = 100
-            except Exception as e:
-                self._log("CRITICAL", f"Filesystem parse failed: {e}")
-                self._status_text = "Filesystem parse failed"
-                self._status_pct = None
+            self._run_parse_fs(part, label="Manual")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1035,7 +1034,46 @@ class PyDDEUGui:
                 self._log("INFO", "Using cached NTFS boot info from Smart Scan.")
 
             boot_at_offset: int | None = None
-            for off in (base_offset, base_offset + 512, base_offset - 512):
+
+            # Try primary boot, then backup boot near the end (DMDE "~x C" case),
+            # and also "next partition start - 1 sector" as a backup-boot heuristic.
+            try_offsets: list[int] = [base_offset, base_offset + 512, base_offset - 512]
+
+            if int(getattr(part, "length", 0) or 0) > 0:
+                end_off = int(base_offset + int(part.length) - 512)
+                try_offsets.extend([end_off, end_off - 512, end_off + 512])
+
+            try:
+                next_start = min(
+                    int(p.start_offset)
+                    for p in (self.partitions or [])
+                    if int(p.start_offset) > base_offset
+                )
+                guess_backup = int(next_start - 512)
+                try_offsets.extend([guess_backup, guess_backup - 512, guess_backup + 512])
+            except Exception:
+                pass
+
+            # De-dup while preserving order and keeping offsets in range.
+            disk_size = 0
+            try:
+                disk_size = int(src.size() or 0)
+            except Exception:
+                disk_size = 0
+            seen_offs: set[int] = set()
+            ordered_offs: list[int] = []
+            for off in try_offsets:
+                off = int(off)
+                if off < 0:
+                    continue
+                if disk_size > 0 and off >= disk_size:
+                    continue
+                if off in seen_offs:
+                    continue
+                seen_offs.add(off)
+                ordered_offs.append(off)
+
+            for off in ordered_offs:
                 if off < 0:
                     continue
                 boot_buf = safe_read_granular(src, self.state, int(off), 512, log_cb=None)
@@ -1043,6 +1081,8 @@ class PyDDEUGui:
                 if parsed:
                     boot = parsed
                     boot_at_offset = int(off)
+                    if off != base_offset:
+                        self._log("WARNING", f"{prefix}Using NTFS boot from offset {off} (primary unreadable?)")
                     break
 
             if boot and boot_at_offset is None:
