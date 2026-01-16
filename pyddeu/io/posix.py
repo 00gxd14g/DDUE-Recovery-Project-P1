@@ -274,6 +274,39 @@ class LinuxDiskSource(DiskSource):
         if size <= 0:
             return b""
 
+        def _disable_direct_io() -> bool:
+            """
+            If O_DIRECT caused EINVAL (buffer alignment issues), reopen without it
+            and retry once. Keeps behavior closer to DMDE, which falls back when
+            direct I/O is unsupported.
+            """
+            if not self._use_direct:
+                return False
+            flags = os.O_RDONLY
+            if hasattr(os, "O_BINARY"):
+                flags |= os.O_BINARY
+            try:
+                new_fd = os.open(self.path, flags)
+            except Exception:
+                return False
+            old_fd = self._fd
+            self._fd = new_fd
+            self._use_direct = False
+            try:
+                if old_fd >= 0:
+                    os.close(old_fd)
+            except Exception:
+                pass
+            return True
+
+        def _pread_with_timeout(fd: int, off: int, sz: int) -> bytes:
+            if self._timeout_ms > 0:
+                return _read_with_timeout_thread(fd, off, sz, self._timeout_ms)
+            if hasattr(os, "pread"):
+                return os.pread(fd, sz, off)
+            os.lseek(fd, off, os.SEEK_SET)
+            return os.read(fd, sz)
+
         with self._lock:
             if self._fd < 0:
                 raise OSError(errno.EBADF, "Bad file descriptor")
@@ -287,17 +320,13 @@ class LinuxDiskSource(DiskSource):
                 if aligned_size <= 0:
                     return b""
 
-                # Read with timeout
-                if self._timeout_ms > 0:
-                    data = _read_with_timeout_thread(
-                        self._fd, aligned_start, aligned_size, self._timeout_ms
-                    )
-                else:
-                    if hasattr(os, 'pread'):
-                        data = os.pread(self._fd, aligned_size, aligned_start)
+                try:
+                    data = _pread_with_timeout(self._fd, aligned_start, aligned_size)
+                except OSError as e:
+                    if e.errno == errno.EINVAL and _disable_direct_io():
+                        data = _pread_with_timeout(self._fd, aligned_start, aligned_size)
                     else:
-                        os.lseek(self._fd, aligned_start, os.SEEK_SET)
-                        data = os.read(self._fd, aligned_size)
+                        raise
 
                 # Extract the requested portion
                 if not data:
@@ -307,14 +336,13 @@ class LinuxDiskSource(DiskSource):
                 return data[data_offset:data_offset + data_size]
 
             # For regular files, just read directly with timeout
-            if self._timeout_ms > 0:
-                data = _read_with_timeout_thread(self._fd, offset, size, self._timeout_ms)
-            else:
-                if hasattr(os, 'pread'):
-                    data = os.pread(self._fd, size, offset)
+            try:
+                data = _pread_with_timeout(self._fd, offset, size)
+            except OSError as e:
+                if e.errno == errno.EINVAL and _disable_direct_io():
+                    data = _pread_with_timeout(self._fd, offset, size)
                 else:
-                    os.lseek(self._fd, offset, os.SEEK_SET)
-                    data = os.read(self._fd, size)
+                    raise
 
             return data
 

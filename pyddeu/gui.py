@@ -714,23 +714,52 @@ class PyDDEUGui:
                 self.state.wait_if_paused()
                 parts = scan_partitions(self.source, state=self.state, log_cb=self._log)
                 if not parts:
-                    self._log("WARNING", "No MBR/GPT partitions found. Trying read-only NTFS carve…")
+                    self._log("WARNING", "No MBR/GPT partitions found. Trying optimized boot-sector carving (NTFS/exFAT/FAT32).")
                     total = self.source.size() or 0
 
                     def prog(off: int, total_size: int, hits: int) -> None:
                         if total_size > 0:
                             self._status_pct = int(min(99, (off / total_size) * 100))
-                        self._status_text = f"Carving NTFS boots… hits={hits}"
+                        self._status_text = f"Carving boot sectors… hits={hits}"
 
-                    parts = carve_ntfs_partitions(
-                        self.source,
-                        state=self.state,
-                        log_cb=self._log,
-                        progress_cb=prog,
-                        source_path=self.source_path,
+                    carved: list[Partition] = []
+                    carved.extend(
+                        carve_ntfs_partitions(
+                            self.source,
+                            state=self.state,
+                            log_cb=self._log,
+                            progress_cb=prog,
+                            source_path=self.source_path,
+                            config=self.config,
+                        )
                     )
+                    carved.extend(
+                        carve_exfat_partitions(
+                            self.source,
+                            state=self.state,
+                            log_cb=self._log,
+                            progress_cb=prog,
+                            source_path=self.source_path,
+                            config=self.config,
+                        )
+                    )
+                    carved.extend(
+                        carve_fat32_partitions(
+                            self.source,
+                            state=self.state,
+                            log_cb=self._log,
+                            progress_cb=prog,
+                            source_path=self.source_path,
+                            config=self.config,
+                        )
+                    )
+                    if carved:
+                        dedup: dict[int, Partition] = {}
+                        for p in carved:
+                            dedup.setdefault(int(p.start_offset), p)
+                        parts = sorted(dedup.values(), key=lambda p: p.start_offset)
                     if not parts:
-                        self._log("WARNING", "No carved NTFS boot sectors found.")
+                        self._log("WARNING", "No carved NTFS/exFAT/FAT32 boot sectors found. Use RAW File Carve if needed.")
                 for p in parts:
                     self.partitions.append(p)
                     self.ui_queue.put(p)
@@ -778,13 +807,23 @@ class PyDDEUGui:
         if not self.source:
             return
         sel = self.list_parts.curselection()
-        if not sel:
-            messagebox.showwarning("Select partition", "Pick a partition first.")
-            return
-        idx = sel[0]
-        if idx >= len(self.partitions):
-            return
-        part = self.partitions[idx]
+        if sel:
+            idx = sel[0]
+            if idx >= len(self.partitions):
+                return
+            part = self.partitions[idx]
+        else:
+            part = self._pick_smart_partition(self.partitions)
+            if not part:
+                messagebox.showwarning("Select partition", "Pick a partition first.")
+                return
+            # Reflect auto-selection in UI for clarity
+            try:
+                picked_idx = self.partitions.index(part)
+                self.list_parts.selection_clear(0, tk.END)
+                self.list_parts.selection_set(picked_idx)
+            except Exception:
+                pass
 
         self.tree.delete(*self.tree.get_children())
         self.node_metadata = {}
@@ -819,13 +858,22 @@ class PyDDEUGui:
         if not self.source:
             return
         sel = self.list_parts.curselection()
-        if not sel:
-            messagebox.showwarning("Select partition", "Pick a partition first.")
-            return
-        idx = sel[0]
-        if idx >= len(self.partitions):
-            return
-        part = self.partitions[idx]
+        if sel:
+            idx = sel[0]
+            if idx >= len(self.partitions):
+                return
+            part = self.partitions[idx]
+        else:
+            part = self._pick_smart_partition(self.partitions)
+            if not part:
+                messagebox.showwarning("Select partition", "Pick a partition first.")
+                return
+            try:
+                picked_idx = self.partitions.index(part)
+                self.list_parts.selection_clear(0, tk.END)
+                self.list_parts.selection_set(picked_idx)
+            except Exception:
+                pass
 
         def worker() -> None:
             self._run_deep_ntfs_scan(part, label="Manual")
