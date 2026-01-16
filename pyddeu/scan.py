@@ -197,12 +197,12 @@ def safe_read_granular(
             i += chunk
 
     buf = bytearray(b"\x00" * size)
-    # If we are already in a heavy error streak, zero-fill quickly and bump skip size
+    # If we are already in a heavy error streak, zero-fill quickly and modestly bump skip size
     if state.consecutive_errors >= 4:
         state.register_error(offset, size)
         fill_pattern(buf, 0, size, bad_filler)
         try:
-            state.skip_size = state.max_skip_size
+            state.skip_size = max(state.skip_size, min(state.max_skip_size, 8 * 1024 * 1024))
         except Exception:
             pass
         return bytes(buf)

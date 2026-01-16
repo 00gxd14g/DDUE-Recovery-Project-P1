@@ -141,7 +141,7 @@ class RecoveryState:
         self,
         map_path: Path,
         block_size: int = 4096,
-        max_skip_size: int = 1024 * 1024 * 1024,  # allow large jumps on toxic regions
+        max_skip_size: int = 128 * 1024 * 1024,  # cap skips to 128MB to avoid missing structures
         config: Optional[PyddeuConfig] = None,
     ):
         self.block_size = int(block_size)
@@ -202,8 +202,8 @@ class RecoveryState:
         """
         with self._lock:
             self._panic_level = min(self._panic_level + 1, 30)
-            # Jump to max skip to move past toxic regions fast.
-            self.skip_size = self.max_skip_size
+            # Increase skip size but keep it bounded so we don't leap past partitions.
+            self.skip_size = max(self.skip_size, min(self.max_skip_size, 16 * 1024 * 1024))
             # Do not pause; keep streaming while marking panic for logging.
             self.pause_until = 0.0
 
