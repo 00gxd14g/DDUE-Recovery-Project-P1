@@ -133,6 +133,18 @@ class PyDDEUGui:
         source_menu.add_separator()
         source_menu.add_command(label="Connect", command=self.action_connect)
 
+        scans_btn = ttk.Menubutton(toolbar, text="Scans")
+        scans_btn.pack(side=tk.LEFT, padx=2)
+        scans_menu = tk.Menu(scans_btn, tearoff=0)
+        scans_btn["menu"] = scans_menu
+        scans_menu.add_command(label="Scan Partitions", command=self.action_scan_partitions)
+        scans_menu.add_separator()
+        scans_menu.add_command(label="Parse NTFS (pytsk3)", command=self.action_parse_fs)
+        scans_menu.add_command(label="Deep Scan (NTFS MFT)", command=self.action_deep_ntfs_scan)
+        scans_menu.add_separator()
+        scans_menu.add_command(label="MFT Scan (RAW)", command=self.action_mft_scan)
+        scans_menu.add_command(label="File Carve (RAW)", command=self.action_file_carve)
+
         smart_btn = ttk.Button(toolbar, text="Start Smart Recovery", command=self.action_smart_recovery)
         smart_btn.pack(side=tk.LEFT, padx=(10, 2))
 
