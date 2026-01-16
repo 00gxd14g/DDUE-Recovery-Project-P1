@@ -435,18 +435,31 @@ def carve_ntfs_partitions(
 
     def read_chunk(off: int, size_bytes: int) -> tuple[bytes, bool]:
         nonlocal cur_src
+        sec = src.sector_size() or DEFAULT_SECTOR_SIZE
+        if sec <= 0:
+            sec = DEFAULT_SECTOR_SIZE
         if state:
             state.wait_if_paused()
             if state.stop_requested or not state.is_alive:
                 return b"", False
             if state.bad_map.contains(off, size_bytes):
                 return b"", True
+        # Align to sector boundaries to avoid EINVAL on some controllers/O_DIRECT
+        aligned_off = off - (off % sec)
+        delta = off - aligned_off
+        aligned_size = ((size_bytes + delta + sec - 1) // sec) * sec
+        if aligned_size <= 0:
+            return b"", False
         for attempt in range(2):
             try:
-                data = cur_src.read_at(off, size_bytes)
-                if len(data) < size_bytes:
-                    data += b"\x00" * (size_bytes - len(data))
-                return data, False
+                data = cur_src.read_at(aligned_off, aligned_size)
+                if len(data) < aligned_size:
+                    data += b"\x00" * (aligned_size - len(data))
+                start = delta
+                end = min(delta + size_bytes, len(data))
+                if start >= end:
+                    return b"", False
+                return data[start:end], False
             except OSError as e:
                 if state:
                     try:
@@ -624,18 +637,30 @@ def carve_exfat_partitions(
 
     def read_chunk(off: int, size_bytes: int) -> tuple[bytes, bool]:
         nonlocal cur_src
+        sec = src.sector_size() or DEFAULT_SECTOR_SIZE
+        if sec <= 0:
+            sec = DEFAULT_SECTOR_SIZE
         if state:
             state.wait_if_paused()
             if state.stop_requested or not state.is_alive:
                 return b"", False
             if state.bad_map.contains(off, size_bytes):
                 return b"", True
+        aligned_off = off - (off % sec)
+        delta = off - aligned_off
+        aligned_size = ((size_bytes + delta + sec - 1) // sec) * sec
+        if aligned_size <= 0:
+            return b"", False
         for attempt in range(2):
             try:
-                data = cur_src.read_at(off, size_bytes)
-                if len(data) < size_bytes:
-                    data += b"\x00" * (size_bytes - len(data))
-                return data, False
+                data = cur_src.read_at(aligned_off, aligned_size)
+                if len(data) < aligned_size:
+                    data += b"\x00" * (aligned_size - len(data))
+                start = delta
+                end = min(delta + size_bytes, len(data))
+                if start >= end:
+                    return b"", False
+                return data[start:end], False
             except OSError as e:
                 if log_cb:
                     log_cb("CRITICAL", f"Carve chunk read failed @{off} (+{size_bytes}) attempt {attempt + 1}: {e}")
@@ -789,18 +814,30 @@ def carve_fat32_partitions(
 
     def read_chunk(off: int, size_bytes: int) -> tuple[bytes, bool]:
         nonlocal cur_src
+        sec = src.sector_size() or DEFAULT_SECTOR_SIZE
+        if sec <= 0:
+            sec = DEFAULT_SECTOR_SIZE
         if state:
             state.wait_if_paused()
             if state.stop_requested or not state.is_alive:
                 return b"", False
             if state.bad_map.contains(off, size_bytes):
                 return b"", True
+        aligned_off = off - (off % sec)
+        delta = off - aligned_off
+        aligned_size = ((size_bytes + delta + sec - 1) // sec) * sec
+        if aligned_size <= 0:
+            return b"", False
         for attempt in range(2):
             try:
-                data = cur_src.read_at(off, size_bytes)
-                if len(data) < size_bytes:
-                    data += b"\x00" * (size_bytes - len(data))
-                return data, False
+                data = cur_src.read_at(aligned_off, aligned_size)
+                if len(data) < aligned_size:
+                    data += b"\x00" * (aligned_size - len(data))
+                start = delta
+                end = min(delta + size_bytes, len(data))
+                if start >= end:
+                    return b"", False
+                return data[start:end], False
             except OSError as e:
                 if log_cb:
                     log_cb("CRITICAL", f"Carve chunk read failed @{off} (+{size_bytes}) attempt {attempt + 1}: {e}")
