@@ -775,7 +775,12 @@ class PyDDEUGui:
 
     def _ui_add_partition(self, p: Partition) -> None:
         gb = p.length / (1024**3)
-        label = f"[{p.index}] {p.scheme} {p.type_str} start={p.start_offset} size={gb:.2f}GB"
+        lba_start = int(p.start_offset // 512) if p.start_offset >= 0 else 0
+        lba_end = int((p.start_offset + max(0, p.length)) // 512 - 1) if p.length > 0 else lba_start
+        label = (
+            f"[{p.index}] {p.scheme} {p.type_str} "
+            f"LBA={lba_start}..{lba_end} start={p.start_offset} size={gb:.2f}GB"
+        )
         if p.name:
             label += f" name={p.name}"
         self.list_parts.insert(tk.END, label)

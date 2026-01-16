@@ -27,8 +27,13 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         parts = scan_partitions(src, state=state, log_cb=log_cb)
         for p in parts:
             gb = p.length / (1024**3)
+            lba_start = int(p.start_offset // 512) if p.start_offset >= 0 else 0
+            lba_end = int((p.start_offset + max(0, p.length)) // 512 - 1) if p.length > 0 else lba_start
             name = f" name={p.name}" if p.name else ""
-            print(f"[{p.index}] {p.scheme} {p.type_str} start={p.start_offset} size={gb:.2f}GB{name}")
+            print(
+                f"[{p.index}] {p.scheme} {p.type_str} LBA={lba_start}..{lba_end} "
+                f"start={p.start_offset} size={gb:.2f}GB{name}"
+            )
         return 0
     finally:
         src.close()
