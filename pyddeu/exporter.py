@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -100,7 +101,7 @@ class RobustExporter:
                         err_msg = str(e)
                         out_file.write(b"\x00" * to_read)
                         offset += to_read
-                        if self._is_controller_error(e):
+                        if self._is_controller_error(e) and getattr(e, "errno", None) not in (errno.ETIMEDOUT,):
                             try:
                                 self.state.register_controller_panic(log_cb=self.log_cb)  # type: ignore[attr-defined]
                             except Exception:

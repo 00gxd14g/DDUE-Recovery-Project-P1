@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import binascii
+import errno
 import struct
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -461,7 +462,8 @@ def carve_ntfs_partitions(
                     return b"", False
                 return data[start:end], False
             except OSError as e:
-                if state:
+                # Timeouts are treated as media faults; don't escalate to controller panic
+                if state and getattr(e, "errno", None) not in (errno.ETIMEDOUT,):
                     try:
                         state.register_controller_panic(log_cb=log_cb)
                     except Exception:
@@ -662,6 +664,11 @@ def carve_exfat_partitions(
                     return b"", False
                 return data[start:end], False
             except OSError as e:
+                if state and getattr(e, "errno", None) not in (errno.ETIMEDOUT,):
+                    try:
+                        state.register_controller_panic(log_cb=log_cb)
+                    except Exception:
+                        pass
                 if log_cb:
                     log_cb("CRITICAL", f"Carve chunk read failed @{off} (+{size_bytes}) attempt {attempt + 1}: {e}")
                 if attempt == 0 and reopen_source():
@@ -839,6 +846,11 @@ def carve_fat32_partitions(
                     return b"", False
                 return data[start:end], False
             except OSError as e:
+                if state and getattr(e, "errno", None) not in (errno.ETIMEDOUT,):
+                    try:
+                        state.register_controller_panic(log_cb=log_cb)
+                    except Exception:
+                        pass
                 if log_cb:
                     log_cb("CRITICAL", f"Carve chunk read failed @{off} (+{size_bytes}) attempt {attempt + 1}: {e}")
                 if attempt == 0 and reopen_source():

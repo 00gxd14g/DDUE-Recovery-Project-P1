@@ -26,9 +26,9 @@ LINUX_PANIC_CODES = frozenset({
     errno.EIO,         # 5: I/O error
     errno.ENXIO,       # 6: No such device or address
     errno.ENODEV,      # 19: No such device
-    errno.ETIMEDOUT,   # 110: Connection timed out
     errno.ENOMEDIUM,   # 123: No medium found (if available)
     errno.EBUSY,       # 16: Device or resource busy
+    # NOTE: ETIMEDOUT is treated as recoverable (bad/slow media) to avoid auto-panic.
 })
 
 # Add ENOMEDIUM if available (not on all systems)
@@ -48,6 +48,8 @@ def _is_panic_error(e: OSError) -> bool:
 
     # Linux: check errno
     err_code = getattr(e, "errno", 0) or 0
+    if err_code == errno.ETIMEDOUT:
+        return False
     return err_code in LINUX_PANIC_CODES
 
 
@@ -120,6 +122,8 @@ def safe_read_granular(
 
     def maybe_panic(e: OSError) -> None:
         nonlocal refreshed
+        if getattr(e, "errno", None) == errno.ETIMEDOUT:
+            return
         # Check if this error indicates a device/controller panic
         if not _is_panic_error(e):
             return

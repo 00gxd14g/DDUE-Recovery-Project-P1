@@ -197,24 +197,15 @@ class RecoveryState:
     def register_controller_panic(self, log_cb: Optional[LogCb] = None) -> None:
         """
         Called when OS logs indicate a device reset/controller panic.
-        After too many panics, we auto-stop to prevent infinite loops.
+        On Linux we avoid auto-stopping; we just back off and keep going,
+        matching DMDE-style persistence on weak media.
         """
         with self._lock:
-            self._panic_level = min(self._panic_level + 1, 15)
+            self._panic_level = min(self._panic_level + 1, 30)
             # More aggressive backoff: increase wait time exponentially with each panic
             # First panic: 2s, then 3s, 4.5s, 6.75s... max 30s
             pause_s = min(30.0, 2.0 * (1.5 ** (self._panic_level - 1)))
             self.pause_until = max(self.pause_until, time.time() + pause_s)
-
-            # Auto-stop if too many panics to prevent system hang
-            if self._panic_level >= 10:
-                self.stop_requested = True
-                if log_cb:
-                    try:
-                        log_cb("CRITICAL", f"Too many controller panics ({self._panic_level}). Auto-stopping to prevent system hang.")
-                    except Exception:
-                        pass
-                return
         
         if log_cb:
             try:
