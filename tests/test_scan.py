@@ -77,7 +77,8 @@ class TestIsPanicError(unittest.TestCase):
     def test_linux_etimedout(self):
         """Test Linux ETIMEDOUT detection."""
         err = OSError(errno.ETIMEDOUT, "Connection timed out")
-        self.assertTrue(_is_panic_error(err))
+        # On weak media, timeouts are treated as recoverable (skip), not a controller panic.
+        self.assertFalse(_is_panic_error(err))
 
     @patch('pyddeu.scan.IS_WINDOWS', False)
     def test_linux_non_panic(self):
