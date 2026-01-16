@@ -141,7 +141,7 @@ class RecoveryState:
         self,
         map_path: Path,
         block_size: int = 4096,
-        max_skip_size: int = 1024 * 1024 * 100,
+        max_skip_size: int = 1024 * 1024 * 1024,  # allow large jumps on toxic regions
         config: Optional[PyddeuConfig] = None,
     ):
         self.block_size = int(block_size)
@@ -197,19 +197,19 @@ class RecoveryState:
     def register_controller_panic(self, log_cb: Optional[LogCb] = None) -> None:
         """
         Called when OS logs indicate a device reset/controller panic.
-        On Linux we avoid auto-stopping; we just back off and keep going,
-        matching DMDE-style persistence on weak media.
+        On Linux we avoid auto-stopping; we just back off and skip aggressively
+        (DMDE-style persistence on weak media).
         """
         with self._lock:
             self._panic_level = min(self._panic_level + 1, 30)
-            # More aggressive backoff: increase wait time exponentially with each panic
-            # First panic: 2s, then 3s, 4.5s, 6.75s... max 30s
-            pause_s = min(30.0, 2.0 * (1.5 ** (self._panic_level - 1)))
-            self.pause_until = max(self.pause_until, time.time() + pause_s)
-        
+            # Jump to max skip to move past toxic regions fast.
+            self.skip_size = self.max_skip_size
+            # Do not pause; keep streaming while marking panic for logging.
+            self.pause_until = 0.0
+
         if log_cb:
             try:
-                log_cb("WARNING", f"Controller Panic #{self._panic_level} detected! Pausing for {pause_s:.1f} seconds.")
+                log_cb("WARNING", f"Controller Panic #{self._panic_level} detected! Aggressive skip enabled (skip_size={self.skip_size} bytes).")
             except Exception:
                 pass
 

@@ -123,6 +123,11 @@ def safe_read_granular(
     def maybe_panic(e: OSError) -> None:
         nonlocal refreshed
         if getattr(e, "errno", None) == errno.ETIMEDOUT:
+            # Treat as media timeout; mark skip_size max to hop past this area.
+            try:
+                state.skip_size = state.max_skip_size
+            except Exception:
+                pass
             return
         # Check if this error indicates a device/controller panic
         if not _is_panic_error(e):
@@ -192,6 +197,15 @@ def safe_read_granular(
             i += chunk
 
     buf = bytearray(b"\x00" * size)
+    # If we are already in a heavy error streak, zero-fill quickly and bump skip size
+    if state.consecutive_errors >= 4:
+        state.register_error(offset, size)
+        fill_pattern(buf, 0, size, bad_filler)
+        try:
+            state.skip_size = state.max_skip_size
+        except Exception:
+            pass
+        return bytes(buf)
     end = offset + size
     cur = offset
     while cur < end and not state.stop_requested and state.is_alive:
