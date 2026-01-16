@@ -201,12 +201,12 @@ class RecoveryState:
         """
         with self._lock:
             self._panic_level = min(self._panic_level + 1, 15)
-            # Daha agresif bekleme: her panic'te bekleme süresini artır
-            # İlk panic: 2s, sonra 3s, 4.5s, 6.75s... max 30s
+            # More aggressive backoff: increase wait time exponentially with each panic
+            # First panic: 2s, then 3s, 4.5s, 6.75s... max 30s
             pause_s = min(30.0, 2.0 * (1.5 ** (self._panic_level - 1)))
             self.pause_until = max(self.pause_until, time.time() + pause_s)
-            
-            # Çok fazla panic olduysa otomatik durdur
+
+            # Auto-stop if too many panics to prevent system hang
             if self._panic_level >= 10:
                 self.stop_requested = True
                 if log_cb:
