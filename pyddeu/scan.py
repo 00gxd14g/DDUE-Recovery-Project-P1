@@ -125,10 +125,8 @@ def safe_read_granular(
         if getattr(e, "errno", None) == errno.ETIMEDOUT:
             # Treat as media timeout; bump skip modestly (up to 32MB) instead of maxing out.
             try:
-                state.skip_size = max(
-                    state.skip_size,
-                    min(state.max_skip_size, 32 * 1024 * 1024),
-                )
+                bump = min(state.max_skip_size, 32 * 1024 * 1024)
+                state.skip_size = max(min(state.skip_size, state.max_skip_size), bump)
             except Exception:
                 pass
             return

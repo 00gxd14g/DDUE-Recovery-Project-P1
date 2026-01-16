@@ -145,7 +145,8 @@ class RecoveryState:
         config: Optional[PyddeuConfig] = None,
     ):
         self.block_size = int(block_size)
-        self.max_skip_size = int(max_skip_size)
+        # Hard ceiling to keep skip behavior reasonable even if caller passes huge values.
+        self.max_skip_size = min(int(max_skip_size), 128 * 1024 * 1024)
         self.config = config or PyddeuConfig()
 
         self.bad_map = BadRegionMap(map_path)
