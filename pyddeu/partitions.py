@@ -577,10 +577,11 @@ def carve_ntfs_partitions(
                             try_ntfs_at(cand)
                     start = pos + 1
 
-            step = base_len
-            if state:
-                step = max(step, int(getattr(state, "skip_size", 0) or 0))
-            offset += step
+                step = base_len
+                if state:
+                    skip_cap = int(getattr(state, "max_skip_size", DEFAULT_SECTOR_SIZE)) or DEFAULT_SECTOR_SIZE
+                    step = max(step, min(skip_cap, int(getattr(state, "skip_size", 0) or 0)))
+                offset += step
     finally:
         if owns_src:
             try:

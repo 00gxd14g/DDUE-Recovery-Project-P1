@@ -161,6 +161,19 @@ class RecoveryState:
         self._lock = threading.Lock()
         self._dirty_counter = 0
 
+    def _clamp_skip(self) -> None:
+        """Ensure skip_size and max_skip_size stay within sane bounds."""
+        self.max_skip_size = min(self.max_skip_size, 128 * 1024 * 1024)
+        self.skip_size = min(self.skip_size, self.max_skip_size)
+        if self.skip_size <= 0:
+            self.skip_size = self.block_size
+
+    def bump_skip(self, target: int) -> None:
+        """Raise skip_size up to target (bounded by max_skip_size)."""
+        with self._lock:
+            self.skip_size = max(self.skip_size, min(self.max_skip_size, max(0, target)))
+            self._clamp_skip()
+
     def reset(self, *, map_path: Optional[Path] = None) -> None:
         """
         Resets adaptive read state and (optionally) swaps the bad-region map.
@@ -176,6 +189,7 @@ class RecoveryState:
             self.pause_until = 0.0
             self._panic_level = 0
             self._dirty_counter = 0
+            self._clamp_skip()
 
     def register_error(self, offset: int, size: int) -> None:
         with self._lock:
@@ -186,6 +200,7 @@ class RecoveryState:
             if self._dirty_counter >= 50:
                 self._dirty_counter = 0
                 self.bad_map.save()
+            self._clamp_skip()
 
     def register_success(self) -> None:
         with self._lock:
@@ -194,6 +209,7 @@ class RecoveryState:
                 self.skip_size = self.block_size
             if self._panic_level > 0:
                 self._panic_level -= 1
+            self._clamp_skip()
 
     def register_controller_panic(self, log_cb: Optional[LogCb] = None) -> None:
         """
@@ -205,6 +221,7 @@ class RecoveryState:
             self._panic_level = min(self._panic_level + 1, 30)
             # Increase skip size but keep it bounded so we don't leap past partitions.
             self.skip_size = max(self.skip_size, min(self.max_skip_size, 16 * 1024 * 1024))
+            self._clamp_skip()
             # Do not pause; keep streaming while marking panic for logging.
             self.pause_until = 0.0
 
