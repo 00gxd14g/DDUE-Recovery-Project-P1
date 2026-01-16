@@ -14,47 +14,210 @@ LogCb = Callable[[str, str], None]
 
 
 class LinuxKernelMonitor(threading.Thread):
-    def __init__(self, log_cb: LogCb, state: Optional[RecoveryState] = None, device_hint: Optional[str] = None):
+    """
+    Enhanced Linux kernel log monitor for disk error detection.
+
+    Monitors dmesg for:
+    - I/O errors (EIO, buffer errors)
+    - Device resets and controller panics
+    - NVMe errors (command failures, timeouts)
+    - SCSI/ATA errors (sense data, aborted commands)
+    - Medium errors (bad sectors, CRC errors)
+    - Device disconnections and reconnections
+    """
+
+    # Patterns that indicate critical device issues requiring panic handling
+    CRITICAL_PATTERNS = (
+        "reset",
+        "disconnected",
+        "offline",
+        "controller is down",
+        "fatal error",
+        "device removed",
+        "task abort",
+        "hard reset",
+        "link down",
+        "not responding",
+        "device not ready",
+        "aborted command",
+        "host reset",
+    )
+
+    # Patterns that indicate I/O errors (warning level)
+    WARNING_PATTERNS = (
+        "i/o error",
+        "buffer i/o",
+        "medium error",
+        "read error",
+        "write error",
+        "crc error",
+        "unrecovered read",
+        "uncorrectable error",
+        "sense data",
+        "command failed",
+        "timeout",
+        "retry",
+        "bad sector",
+    )
+
+    # NVMe-specific patterns
+    NVME_WARNING_PATTERNS = (
+        "nvme",
+        "nvme timeout",
+        "nvme abort",
+        "completion polled",
+    )
+
+    # SCSI/ATA specific patterns
+    SCSI_ATA_PATTERNS = (
+        "ata",
+        "scsi",
+        "sata",
+        "exception emask",
+        "status: {",
+        "sense key",
+    )
+
+    def __init__(
+        self,
+        log_cb: LogCb,
+        state: Optional[RecoveryState] = None,
+        device_hint: Optional[str] = None,
+    ):
         super().__init__(daemon=True)
         self._log_cb = log_cb
         self._state = state
         self._device_hint = device_hint
         self._stop = threading.Event()
+        self._error_count = 0
+        self._last_error_time = 0.0
 
     def stop(self) -> None:
         self._stop.set()
 
+    def _classify_message(self, line: str) -> tuple[str, bool]:
+        """
+        Classify a kernel message and determine severity.
+
+        Returns (level, should_trigger_panic) tuple.
+        """
+        low = line.lower()
+
+        # Check for critical patterns first
+        for pattern in self.CRITICAL_PATTERNS:
+            if pattern in low:
+                return "CRITICAL", True
+
+        # Check for NVMe errors
+        if "nvme" in low:
+            for pattern in ("error", "failed", "timeout", "abort"):
+                if pattern in low:
+                    # NVMe errors are often critical
+                    return "CRITICAL", True
+
+        # Check for SCSI/ATA errors with exception
+        if any(p in low for p in self.SCSI_ATA_PATTERNS):
+            if "exception" in low or "failed" in low:
+                return "CRITICAL", True
+            if any(p in low for p in self.WARNING_PATTERNS):
+                return "WARNING", False
+
+        # Check for warning patterns
+        for pattern in self.WARNING_PATTERNS:
+            if pattern in low:
+                return "WARNING", False
+
+        return "", False
+
+    def _should_process_line(self, line: str) -> bool:
+        """Check if a line should be processed based on device hint."""
+        if not self._device_hint:
+            # No filter - process disk-related messages
+            low = line.lower()
+            return any(k in low for k in (
+                "sd", "nvme", "ata", "scsi", "sata",
+                "i/o", "block", "disk", "drive"
+            ))
+
+        return self._device_hint in line
+
     def run(self) -> None:
+        # Try dmesg -w first (follow mode) - requires root on most systems
         try:
-            proc = subprocess.Popen(["dmesg", "-w"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        except Exception as e:
-            self._log_cb("WARNING", f"Kernel monitor not started: {e}")
-            return
+            proc = subprocess.Popen(
+                ["dmesg", "-w", "-T"],  # -T for human-readable timestamps
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except Exception:
+            # Fallback without -T flag
+            try:
+                proc = subprocess.Popen(
+                    ["dmesg", "-w"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except Exception as e:
+                # dmesg may require root privileges
+                self._log_cb(
+                    "WARNING",
+                    f"Kernel monitor not started (may require root): {e}. "
+                    "Disk error monitoring disabled."
+                )
+                return
 
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
                 if self._stop.is_set():
                     break
+
                 line_s = line.strip()
                 if not line_s:
                     continue
-                if self._device_hint and self._device_hint not in line_s:
+
+                if not self._should_process_line(line_s):
                     continue
-                low = line_s.lower()
-                if "i/o error" in low or "buffer i/o" in low:
-                    self._log_cb("WARNING", f"KERNEL: {line_s}")
-                elif "reset" in low or "disconnected" in low or "offline" in low:
-                    self._log_cb("CRITICAL", f"KERNEL: {line_s}")
-                    if self._state is not None:
-                        self._state.register_controller_panic()
-                elif "nvme" in low and ("error" in low or "failed" in low):
-                    self._log_cb("WARNING", f"KERNEL: {line_s}")
+
+                level, trigger_panic = self._classify_message(line_s)
+
+                if not level:
+                    continue
+
+                # Log the message
+                self._log_cb(level, f"KERNEL: {line_s}")
+
+                # Track error frequency
+                current_time = time.time()
+                if current_time - self._last_error_time < 5.0:
+                    self._error_count += 1
+                else:
+                    self._error_count = 1
+                self._last_error_time = current_time
+
+                # Trigger panic if critical or too many errors in short time
+                if trigger_panic and self._state is not None:
+                    self._state.register_controller_panic(log_cb=self._log_cb)
+                elif self._error_count >= 5 and self._state is not None:
+                    # Many errors in quick succession - treat as panic
+                    self._log_cb(
+                        "WARNING",
+                        f"High error frequency detected ({self._error_count} errors in <5s)"
+                    )
+                    self._state.register_controller_panic(log_cb=self._log_cb)
+                    self._error_count = 0
+
         finally:
             try:
                 proc.terminate()
+                proc.wait(timeout=1.0)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
 
 class WindowsDiskEventMonitor(threading.Thread):

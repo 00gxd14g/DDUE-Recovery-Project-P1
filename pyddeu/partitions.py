@@ -526,19 +526,21 @@ def carve_ntfs_partitions(
                     state.register_error(offset, max(1, base_len))
                 success_streak = 0
                 current_chunk = max(min_chunk, current_chunk // 2)
-                # KRITIK: Hata durumunda minimum 1MB atlama garantisi
-                # Aksi takdirde aynı offset'te sonsuz döngüye giriyor
-                min_skip = max(1024 * 1024, base_len)  # En az 1MB atla
+                # CRITICAL: Guarantee minimum 1MB skip on error to prevent infinite loop
+                # Without this, we could loop forever on same offset
+                min_skip = max(1024 * 1024, base_len, 1)  # At least 1MB or base_len, never 0
                 step = min_skip
                 if state:
                     state_skip = int(getattr(state, "skip_size", 0) or 0)
-                    # Ardişik hatalarda daha agresif atlama (büyükten küçüğe kontrol)
+                    # More aggressive skip on consecutive errors (check largest first)
                     if state.consecutive_errors >= 5:
                         step = max(step, state_skip, 16 * 1024 * 1024)  # 16MB minimum
                     elif state.consecutive_errors >= 3:
                         step = max(step, state_skip, 4 * 1024 * 1024)  # 4MB minimum
                     else:
                         step = max(step, state_skip)
+                # Final safety check: never skip 0 bytes
+                step = max(1, step)
                 if log_cb:
                     log_cb("WARNING", f"Carve read error @ {offset}; skipping {step // (1024 * 1024)}MB, chunk={current_chunk // (1024 * 1024)}MB")
                 offset += step
@@ -692,8 +694,8 @@ def carve_exfat_partitions(
                     state.register_error(offset, max(1, base_len))
                 success_streak = 0
                 current_chunk = max(min_chunk, current_chunk // 2)
-                # KRITIK: Hata durumunda minimum 1MB atlama garantisi
-                min_skip = max(1024 * 1024, base_len)
+                # CRITICAL: Guarantee minimum 1MB skip on error to prevent infinite loop
+                min_skip = max(1024 * 1024, base_len, 1)  # At least 1MB or base_len, never 0
                 step = min_skip
                 if state:
                     state_skip = int(getattr(state, "skip_size", 0) or 0)
@@ -703,6 +705,8 @@ def carve_exfat_partitions(
                         step = max(step, state_skip, 4 * 1024 * 1024)
                     else:
                         step = max(step, state_skip)
+                # Final safety check: never skip 0 bytes
+                step = max(1, step)
                 if log_cb:
                     log_cb("WARNING", f"exFAT carve read error @ {offset}; skipping {step // (1024 * 1024)}MB")
                 offset += step
@@ -855,8 +859,8 @@ def carve_fat32_partitions(
                     state.register_error(offset, max(1, base_len))
                 success_streak = 0
                 current_chunk = max(min_chunk, current_chunk // 2)
-                # KRITIK: Hata durumunda minimum 1MB atlama garantisi
-                min_skip = max(1024 * 1024, base_len)
+                # CRITICAL: Guarantee minimum 1MB skip on error to prevent infinite loop
+                min_skip = max(1024 * 1024, base_len, 1)  # At least 1MB or base_len, never 0
                 step = min_skip
                 if state:
                     state_skip = int(getattr(state, "skip_size", 0) or 0)
@@ -866,6 +870,8 @@ def carve_fat32_partitions(
                         step = max(step, state_skip, 4 * 1024 * 1024)
                     else:
                         step = max(step, state_skip)
+                # Final safety check: never skip 0 bytes
+                step = max(1, step)
                 if log_cb:
                     log_cb("WARNING", f"FAT32 carve read error @ {offset}; skipping {step // (1024 * 1024)}MB")
                 offset += step

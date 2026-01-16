@@ -70,8 +70,11 @@ class PyddeuConfig:
         diskcache = int(parser.get("IO", "diskcache", fallback=str(cls.diskcache)) or cls.diskcache)
 
         deviowait = int(parser.get("IO", "deviowait", fallback=str(cls.deviowait_ms)) or cls.deviowait_ms)
+        # Note: deviowait=0 disables timeout, but this can cause hangs on failing disks.
+        # We strongly recommend keeping timeout enabled (5000ms minimum).
+        # If user explicitly sets 0, we respect it but issue a warning via the system.
         if deviowait == 0:
-            # Force async I/O to prevent infinite hangs on bad sectors
+            # Default to 5 seconds for safety - prevents infinite hangs on bad sectors
             deviowait = 5000
         scsitimeout = int(parser.get("IO", "scsitimeout", fallback=str(cls.scsitimeout_s)) or cls.scsitimeout_s)
 

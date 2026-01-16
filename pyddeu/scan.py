@@ -1,13 +1,54 @@
 from __future__ import annotations
 
+import errno
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
 from .io.base import DiskSource
 from .state import RecoveryState
+from .platform import IS_WINDOWS
 
 
 LogCb = Callable[[str, str], None]
+
+
+# Windows error codes that indicate controller/device issues
+WINDOWS_PANIC_CODES = frozenset({
+    21,    # ERROR_NOT_READY: device not ready
+    55,    # ERROR_DEV_NOT_EXIST: resource unavailable
+    1117,  # ERROR_IO_DEVICE: device request failed
+    1460,  # ERROR_TIMEOUT: operation timed out
+    87,    # ERROR_INVALID_PARAMETER: sometimes after reset
+})
+
+# Linux errno values that indicate controller/device issues
+LINUX_PANIC_CODES = frozenset({
+    errno.EIO,         # 5: I/O error
+    errno.ENXIO,       # 6: No such device or address
+    errno.ENODEV,      # 19: No such device
+    errno.ETIMEDOUT,   # 110: Connection timed out
+    errno.ENOMEDIUM,   # 123: No medium found (if available)
+    errno.EBUSY,       # 16: Device or resource busy
+})
+
+# Add ENOMEDIUM if available (not on all systems)
+try:
+    LINUX_PANIC_CODES = LINUX_PANIC_CODES | {errno.EMEDIUMTYPE}  # 124
+except AttributeError:
+    pass
+
+
+def _is_panic_error(e: OSError) -> bool:
+    """Check if an OSError indicates a device/controller panic condition."""
+    if IS_WINDOWS:
+        winerr = getattr(e, "winerror", None)
+        if winerr is not None:
+            return int(winerr) in WINDOWS_PANIC_CODES
+        return False
+
+    # Linux: check errno
+    err_code = getattr(e, "errno", 0) or 0
+    return err_code in LINUX_PANIC_CODES
 
 
 @dataclass(frozen=True)
@@ -79,38 +120,37 @@ def safe_read_granular(
 
     def maybe_panic(e: OSError) -> None:
         nonlocal refreshed
-        winerr = getattr(e, "winerror", None)
-        err = int(winerr) if winerr is not None else int(getattr(e, "errno", 0) or 0)
-        # Error codes that indicate controller/device reset:
-        # 21: device not ready, 55: resource unavailable, 1117: device request failed
-        # 1460: timeout, 87: invalid parameter (sometimes after reset)
-        if err in (21, 55, 1117, 1460, 87):
+        # Check if this error indicates a device/controller panic
+        if not _is_panic_error(e):
+            return
+
+        try:
+            state.register_controller_panic(log_cb=log_cb)
+        except Exception:
+            pass
+
+        # Try to refresh handle ONLY ONCE, and don't fail if it times out
+        if not refreshed:
+            refreshed = True
             try:
-                state.register_controller_panic(log_cb=log_cb)
-            except Exception:
-                pass
-            # Try to refresh handle ONLY ONCE, and don't fail if it times out
-            if not refreshed:
-                refreshed = True
-                try:
-                    refresh = getattr(src, "refresh_with_timeout", None)
-                    if callable(refresh):
-                        # Use short timeout - don't block forever
-                        ok = refresh(timeout_s=2.0)
-                        if not ok and log_cb:
-                            log_cb("WARNING", "Disk handle refresh timed out; will retry on next reset.")
-                    else:
-                        # Fallback to regular refresh with try/catch
-                        refresh2 = getattr(src, "refresh", None)
-                        if callable(refresh2):
-                            try:
-                                refresh2()
-                            except Exception as re:
-                                if log_cb:
-                                    log_cb("WARNING", f"Disk handle refresh failed: {re}")
-                except Exception as outer_e:
-                    if log_cb:
-                        log_cb("WARNING", f"Disk refresh error ignored: {outer_e}")
+                refresh = getattr(src, "refresh_with_timeout", None)
+                if callable(refresh):
+                    # Use short timeout - don't block forever
+                    ok = refresh(timeout_s=2.0)
+                    if not ok and log_cb:
+                        log_cb("WARNING", "Disk handle refresh timed out; will retry on next reset.")
+                else:
+                    # Fallback to regular refresh with try/catch
+                    refresh2 = getattr(src, "refresh", None)
+                    if callable(refresh2):
+                        try:
+                            refresh2()
+                        except Exception as re:
+                            if log_cb:
+                                log_cb("WARNING", f"Disk handle refresh failed: {re}")
+            except Exception as outer_e:
+                if log_cb:
+                    log_cb("WARNING", f"Disk refresh error ignored: {outer_e}")
 
     try:
         data = src.read_at(offset, size)
