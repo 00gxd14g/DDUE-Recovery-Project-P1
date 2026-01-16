@@ -298,8 +298,9 @@ class TestRecoveryState(unittest.TestCase):
 
         # Should have logged warning
         self.assertTrue(any("Controller Panic" in msg for _, msg in log_messages))
-        # Should have set pause
-        self.assertGreater(state.pause_until, 0)
+        # Should not pause (DMDE-style: keep going), but should bump skip size.
+        self.assertEqual(state.pause_until, 0)
+        self.assertGreaterEqual(state.skip_size, 16 * 1024 * 1024)
 
     def test_controller_panic_auto_stop(self):
         """Test auto-stop after too many panics."""
@@ -309,7 +310,8 @@ class TestRecoveryState(unittest.TestCase):
         for _ in range(15):
             state.register_controller_panic()
 
-        self.assertTrue(state.stop_requested)
+        # Should not auto-stop; it should keep going with aggressive skip.
+        self.assertFalse(state.stop_requested)
 
     def test_wait_if_paused(self):
         """Test pause waiting."""

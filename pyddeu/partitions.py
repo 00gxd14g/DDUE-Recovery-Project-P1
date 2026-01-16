@@ -119,9 +119,17 @@ def _guid_to_str(g: bytes) -> str:
     return f"{d1:08x}-{d2:04x}-{d3:04x}-{d4_hex[:4]}-{d4_hex[4:]}"
 
 
-def _parse_gpt(src: DiskSource, *, state: Optional[RecoveryState] = None, log_cb: Optional[Callable[[str, str], None]] = None) -> list[Partition]:
-    sector_size = src.sector_size() or DEFAULT_SECTOR_SIZE
-    header = safe_read_granular(src, state or _NULL_STATE, sector_size, sector_size, log_cb=log_cb)
+def _parse_gpt(
+    src: DiskSource,
+    *,
+    sector_size: int = DEFAULT_SECTOR_SIZE,
+    state: Optional[RecoveryState] = None,
+    log_cb: Optional[Callable[[str, str], None]] = None,
+) -> list[Partition]:
+    sector_size = int(sector_size or DEFAULT_SECTOR_SIZE)
+    if sector_size not in (512, 1024, 2048, 4096):
+        sector_size = DEFAULT_SECTOR_SIZE
+    header = safe_read_granular(src, state or _NULL_STATE, sector_size, sector_size, log_cb=log_cb, sector_size=DEFAULT_SECTOR_SIZE)
     if len(header) < sector_size or header[:8] != b"EFI PART":
         return []
 
@@ -138,6 +146,7 @@ def _parse_gpt(src: DiskSource, *, state: Optional[RecoveryState] = None, log_cb
         part_entry_lba * sector_size,
         table_bytes,
         log_cb=log_cb,
+        sector_size=DEFAULT_SECTOR_SIZE,
     )
     parts: list[Partition] = []
 
@@ -201,8 +210,11 @@ def scan_partitions(
     state: Optional[RecoveryState] = None,
     log_cb: Optional[Callable[[str, str], None]] = None,
 ) -> list[Partition]:
-    sector_size = src.sector_size() or DEFAULT_SECTOR_SIZE
-    disk_size = src.size() or 0
+    # DMDE-style addressing: treat "LBA" as 512-byte units for scanning/probing,
+    # even if the device reports 4K logical/physical sectors (common on USB enclosures).
+    lba_size = DEFAULT_SECTOR_SIZE
+    disk_size = int(src.size() or 0)
+    disk_lbas = (disk_size // lba_size) if disk_size > 0 else 0
 
     # 1. Try MBR at Sector 0
     boot = b""
@@ -210,7 +222,7 @@ def scan_partitions(
     
     # Try multiple times since Sector 0 is critical
     for attempt in range(3):
-        boot = safe_read_granular(src, state or _NULL_STATE, 0, sector_size, log_cb=log_cb)
+        boot = safe_read_granular(src, state or _NULL_STATE, 0, lba_size, log_cb=log_cb, sector_size=lba_size)
         if _is_mbr(boot[:DEFAULT_SECTOR_SIZE]):
             mbr_valid = True
             break
@@ -224,7 +236,10 @@ def scan_partitions(
         mbr_parts = _parse_mbr(boot)
         # Check for GPT Protective MBR -> Go for GPT
         if any("GPT Protective" in p.type_str for p in mbr_parts):
-            gpt_parts = _parse_gpt(src, state=state, log_cb=log_cb)
+            gpt_parts = _parse_gpt(src, sector_size=DEFAULT_SECTOR_SIZE, state=state, log_cb=log_cb)
+            if not gpt_parts:
+                # Some devices expose 4K logical sectors; try again at that stride.
+                gpt_parts = _parse_gpt(src, sector_size=int(src.sector_size() or 0), state=state, log_cb=log_cb)
             if gpt_parts:
                 return gpt_parts
             # If GPT parse failed, return protective MBR entry (better than nothing)
@@ -238,11 +253,13 @@ def scan_partitions(
 
     # 2. If MBR invalid (read error) or Empty, TRY GPT Header directly at LBA 1
     # (Some disks might have bad LBA 0 but valid LBA 1)
-    if disk_size > sector_size * 2:
+    if disk_size > lba_size * 2:
         try:
             # We bypass _parse_gpt's protective check by calling logic manually here?
             # actually _parse_gpt reads LBA 1.
-            gpt_parts = _parse_gpt(src, state=state, log_cb=log_cb)
+            gpt_parts = _parse_gpt(src, sector_size=DEFAULT_SECTOR_SIZE, state=state, log_cb=log_cb)
+            if not gpt_parts:
+                gpt_parts = _parse_gpt(src, sector_size=int(src.sector_size() or 0), state=state, log_cb=log_cb)
             if gpt_parts:
                 if log_cb: log_cb("INFO", "Found valid GPT despite missing/bad MBR.")
                 return gpt_parts
@@ -285,15 +302,15 @@ def scan_partitions(
             continue
         seen_lbas.add(lba)
         
-        offset = lba * sector_size
-        if offset >= disk_size or offset < 0:
+        offset = int(lba) * lba_size
+        if offset < 0 or (disk_size > 0 and offset >= disk_size):
             continue
 
         # Read boot sector candidate
         if log_cb:
             log_cb("DEBUG", f"Smart Scan: probing LBA {lba} (offset {offset})")
             
-        data = safe_read_granular(src, state or _NULL_STATE, offset, max(sector_size, 512), log_cb=None)
+        data = safe_read_granular(src, state or _NULL_STATE, offset, 512, log_cb=None, sector_size=lba_size)
         if not data:
             continue
             
@@ -306,13 +323,14 @@ def scan_partitions(
         parsed_ntfs = parse_ntfs_boot_sector(data)
         if parsed_ntfs and parsed_ntfs.total_sectors > 0:
             found_len = parsed_ntfs.volume_size_bytes
-            s_len = parsed_ntfs.total_sectors
+            # Convert to 512-byte LBA units regardless of NTFS bytes-per-sector.
+            s_len = int(found_len // lba_size) if found_len > 0 else 0
             p_type = "NTFS (Smart Scan)"
             p_name = "Found NTFS"
             cached_ntfs_boot = parsed_ntfs  # Cache for later use in deep scan
             
             # CHAIN: Add next partition start
-            next_lba = lba + s_len
+            next_lba = int(lba + s_len) if s_len > 0 else int(lba)
             if next_lba not in seen_lbas:
                 candidates.append(next_lba)
                 # Sometimes there's a 1MB alignment gap (2048 sectors)
@@ -326,7 +344,7 @@ def scan_partitions(
             fsize = _parse_fat32_size(data[:512])
             if fsize:
                 found_len = fsize
-                s_len = fsize // sector_size
+                s_len = int(fsize // lba_size)
                 p_type = "FAT32 (Smart Scan)"
                 p_name = "Found FAT32"
                 
@@ -339,7 +357,7 @@ def scan_partitions(
             xsize = _parse_exfat_size(data[:512])
             if xsize:
                 found_len = xsize
-                s_len = xsize // sector_size
+                s_len = int(xsize // lba_size)
                 p_type = "exFAT (Smart Scan)"
                 p_name = "Found exFAT"
                 
