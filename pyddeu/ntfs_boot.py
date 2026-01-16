@@ -26,7 +26,8 @@ class NtfsBoot:
 def parse_ntfs_boot_sector(buf: bytes) -> Optional[NtfsBoot]:
     if len(buf) < 512:
         return None
-    if buf[3:7] != b"NTFS":
+    # OEM ID is "NTFS    " at offset 3 (8 bytes).
+    if buf[3:11] != b"NTFS    ":
         return None
     if buf[510:512] != b"\x55\xAA":
         return None
@@ -50,6 +51,17 @@ def parse_ntfs_boot_sector(buf: bytes) -> Optional[NtfsBoot]:
         file_record_size = 1 << (-fr_raw)
     if file_record_size < 512 or file_record_size > 8192:
         # Typical is 1024; allow 512..8192
+        return None
+    cluster_size = bps * spc
+    if cluster_size < 512 or cluster_size > 1024 * 1024:
+        return None
+    # Validate key cluster pointers stay within the volume.
+    total_clusters = int(total // spc) if spc > 0 else 0
+    if total_clusters <= 0:
+        return None
+    if mft_lcn <= 0 or mft_lcn >= total_clusters:
+        return None
+    if mftmirr_lcn <= 0 or mftmirr_lcn >= total_clusters:
         return None
     return NtfsBoot(
         bytes_per_sector=bps,

@@ -12,6 +12,9 @@ The Linux implementation has been enhanced to match the capabilities of the Wind
 4. **Device Refresh/Reconnect** - Handles device resets and reconnections
 5. **Enhanced Error Detection** - Linux-specific error code handling
 6. **Improved Kernel Monitoring** - Better detection of disk errors via dmesg
+7. **DMDE-Style 512-byte LBA Probing** - Scans using 512-byte LBAs even on 4K-reporting USB bridges
+8. **NTFS Backup-Boot Normalization** - Avoids off-by-one mounts (e.g., LBA-1 / backup boot sector)
+9. **GUI Smart Mount Offsets** - Auto-corrects `pytsk3` mount offsets by ±1 sector / backup-boot math
 
 ## Detailed Changes
 
@@ -72,11 +75,12 @@ LINUX_PANIC_CODES = frozenset({
     errno.EIO,         # 5: I/O error
     errno.ENXIO,       # 6: No such device or address
     errno.ENODEV,      # 19: No such device
-    errno.ETIMEDOUT,   # 110: Connection timed out
     errno.ENOMEDIUM,   # 123: No medium found
     errno.EBUSY,       # 16: Device or resource busy
 })
 ```
+
+**Note:** `ETIMEDOUT` (110) is treated as *recoverable bad/slow media* on Linux to avoid “panic/stop” on weak SSDs. The scanner bumps skip modestly and continues.
 
 **Platform-aware error classification:**
 ```python
@@ -138,6 +142,7 @@ The implementation follows DMDE's recovery principles:
 - **Partition Table Reading**: MBR/GPT parsing in `partitions.py`
 - **Volume Signature Scanning**: Smart Scan for finding NTFS/FAT32/exFAT boot sectors
 - **Carving**: Boot sector carving when tables are damaged
+- **Backup Boot Handling**: If an NTFS boot is found at the last sector of a volume, compute and use the real start (prevents `pytsk3` opening at the wrong offset).
 
 ### Deleted File Recovery
 - **MFT Parsing**: Reads and interprets NTFS $MFT records
@@ -172,6 +177,7 @@ A comprehensive test suite has been created in `tests/`:
 - `test_scan.py` - Tests for scan module (21 tests)
 - `test_state.py` - Tests for state management (22 tests)
 - `test_monitor.py` - Tests for kernel monitoring (15 tests)
+- `test_partitions.py` - Tests for DMDE-style partition scan normalization
 
 Run tests with:
 ```bash

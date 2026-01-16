@@ -484,6 +484,71 @@ class PyDDEUGui:
             pass
         return chosen
 
+    def _open_fs_smart(self, img: object, src: object, part_offset: int, *, label: str = "") -> tuple[object, int]:
+        """
+        Open a filesystem via pytsk3 with simple offset auto-correction.
+
+        Fixes common cases where the GUI tries:
+        - start_offset - 1 sector (off-by-one)
+        - the NTFS backup boot sector (end-of-volume) instead of the real start
+        """
+        if pytsk3 is None:
+            raise RuntimeError("pytsk3 is not available")
+
+        from .scan import safe_read_granular
+
+        base = int(part_offset)
+        offsets: list[int] = []
+        for delta in (0, 512, -512):
+            off = base + delta
+            if off >= 0:
+                offsets.append(off)
+
+        # If any candidate looks like an NTFS boot sector, also try the derived start.
+        start_candidates: list[int] = []
+        for off in list(offsets):
+            try:
+                boot_buf = safe_read_granular(src, self.state, off, 512, log_cb=None, sector_size=512)
+            except Exception:
+                boot_buf = b""
+            boot = parse_ntfs_boot_sector(boot_buf) if boot_buf else None
+            if not boot:
+                continue
+            vol_lba512 = int(boot.volume_size_bytes // 512) if boot.volume_size_bytes > 0 else 0
+            if vol_lba512 <= 0:
+                continue
+            lba_hit = int(off // 512)
+            start_lba = int(lba_hit - vol_lba512 + 1)
+            if start_lba < 0 or start_lba >= lba_hit:
+                continue
+            start_off = start_lba * 512
+            if start_off >= 0:
+                start_candidates.append(start_off)
+
+        # Prefer computed starts first, then ±1 sector adjustments.
+        candidates = start_candidates + offsets
+        seen: set[int] = set()
+        ordered: list[int] = []
+        for off in candidates:
+            if off in seen:
+                continue
+            seen.add(off)
+            ordered.append(off)
+
+        last_err: Exception | None = None
+        for off in ordered:
+            try:
+                fs = pytsk3.FS_Info(img, offset=int(off))
+                if off != base:
+                    prefix = f"{label} - " if label else ""
+                    self._log("WARNING", f"{prefix}Adjusted filesystem offset: {base} -> {off}")
+                return fs, int(off)
+            except Exception as e:
+                last_err = e
+                continue
+
+        raise last_err or RuntimeError("Failed to open filesystem")
+
     def _run_parse_fs(self, part: Partition, *, label: str = "") -> bool:
         if pytsk3 is None:
             self._log("CRITICAL", f"pytsk3 is not available: {_PYTSK3_IMPORT_ERROR}")
@@ -505,9 +570,9 @@ class PyDDEUGui:
             self._status_pct = None
             src = open_source(self.source_path, config=self.config)
             img = DDEUImg(src, self.state, log_cb=log_cb)
-            fs = pytsk3.FS_Info(img, offset=int(part.start_offset))
+            fs, fs_offset = self._open_fs_smart(img, src, int(part.start_offset), label=label)
             root_dir = fs.open_dir(path="/")
-            self._walk_dir(root_dir, "", int(part.start_offset))
+            self._walk_dir(root_dir, "", int(fs_offset))
             self._log("INFO", f"{prefix}Filesystem parse completed.")
             self._status_text = "Filesystem parse done"
             self._status_pct = 100
@@ -899,9 +964,9 @@ class PyDDEUGui:
                 self._status_pct = None
                 src = open_source(self.source_path, config=self.config)
                 img = DDEUImg(src, self.state, log_cb=log_cb)
-                fs = pytsk3.FS_Info(img, offset=part.start_offset)
+                fs, fs_offset = self._open_fs_smart(img, src, int(part.start_offset), label="Manual")
                 root_dir = fs.open_dir(path="/")
-                self._walk_dir(root_dir, "", part.start_offset)
+                self._walk_dir(root_dir, "", int(fs_offset))
                 src.close()
                 self._log("INFO", "Filesystem parse completed.")
                 self._status_text = "Filesystem parse done"
@@ -957,21 +1022,54 @@ class PyDDEUGui:
             self._status_text = f"{prefix}Deep NTFS scan (MFT)..."
             self._status_pct = 0
             src = open_source(self.source_path, config=self.config)
+
+            from .scan import safe_read_granular
             
-            # Try to use cached NtfsBoot from partition (obtained during Smart Scan)
+            base_offset = int(part.start_offset)
+            part_start_offset = base_offset
+
+            # Prefer cached boot info but still try to locate a readable boot near the selection
+            # (handles off-by-one and weak-media cases).
             boot = part.ntfs_boot
             if boot:
                 self._log("INFO", "Using cached NTFS boot info from Smart Scan.")
-            else:
-                # Fall back to reading boot sector from disk
-                boot_buf = src.read_at(part.start_offset, 512)
-                boot = parse_ntfs_boot_sector(boot_buf)
+
+            boot_at_offset: int | None = None
+            for off in (base_offset, base_offset + 512, base_offset - 512):
+                if off < 0:
+                    continue
+                boot_buf = safe_read_granular(src, self.state, int(off), 512, log_cb=None)
+                parsed = parse_ntfs_boot_sector(boot_buf) if boot_buf else None
+                if parsed:
+                    boot = parsed
+                    boot_at_offset = int(off)
+                    break
+
+            if boot and boot_at_offset is None:
+                boot_at_offset = base_offset
                 
             if not boot:
                 self._log("CRITICAL", "Selected partition does not look like NTFS boot sector.")
                 self._status_text = "Deep scan failed"
                 self._status_pct = None
                 return 0
+
+            # If we found a boot sector at a non-aligned LBA, it may be the NTFS backup boot
+            # (last sector of the volume). Derive the real start so MFT offsets are correct.
+            if boot_at_offset is not None:
+                lba_hit = int(boot_at_offset // 512)
+                vol_lba512 = int(boot.volume_size_bytes // 512) if boot.volume_size_bytes > 0 else 0
+                if vol_lba512 > 0:
+                    start_lba = int(lba_hit - vol_lba512 + 1)
+                    if 0 <= start_lba < lba_hit and (lba_hit % 2048) != 0:
+                        part_start_offset = int(start_lba * 512)
+                    else:
+                        part_start_offset = int(boot_at_offset)
+                else:
+                    part_start_offset = int(boot_at_offset)
+
+            if part_start_offset != base_offset:
+                self._log("WARNING", f"{prefix}Adjusted NTFS start offset: {base_offset} -> {part_start_offset}")
 
             cluster_size = boot.cluster_size
             self._log("INFO", f"NTFS boot parsed: cluster={cluster_size} record={boot.file_record_size}")
@@ -983,11 +1081,10 @@ class PyDDEUGui:
             collected = []
             
             # SMART APPROACH: Try reading MFT directly at known location first
-            mft_offset = part.start_offset + (boot.mft_lcn * cluster_size)
+            mft_offset = part_start_offset + (boot.mft_lcn * cluster_size)
             self._log("INFO", f"Trying direct MFT read at offset {mft_offset} (LCN {boot.mft_lcn})")
             
             # Read the first MFT record ($MFT itself) which contains the data runs for the entire MFT
-            from .scan import safe_read_granular
             from .mft import _decode_runlist_to_lcns
             
             mft_record0 = safe_read_granular(src, self.state, mft_offset, boot.file_record_size, log_cb=log_cb)
@@ -1036,7 +1133,7 @@ class PyDDEUGui:
                             mft_record_num += sparse_records
                             continue
                             
-                        run_offset = part.start_offset + (lcn * cluster_size)
+                        run_offset = part_start_offset + (lcn * cluster_size)
                         run_size = length_clusters * cluster_size
                         records_in_run = run_size // boot.file_record_size
                         
@@ -1106,8 +1203,8 @@ class PyDDEUGui:
                 for rec in scan_and_parse_mft(
                     src,
                     self.state,
-                    start=part.start_offset,
-                    end=part.start_offset + boot.volume_size_bytes,
+                    start=part_start_offset,
+                    end=part_start_offset + boot.volume_size_bytes,
                     step=4096,
                     record_size=boot.file_record_size,
                     log_cb=log_cb,
@@ -1129,7 +1226,7 @@ class PyDDEUGui:
                         size=int(size),
                         status=status,
                         inode=rec.inode,
-                        part_offset=part.start_offset,
+                        part_offset=int(part_start_offset),
                         is_dir=False,
                         resident_data=rec.resident_data,
                         data_runs=rec.data_runs,
@@ -1428,7 +1525,7 @@ class PyDDEUGui:
                 try:
                     src = open_source(self.source_path, config=self.config)
                     img = DDEUImg(src, self.state, log_cb=log_cb)
-                    fs = pytsk3.FS_Info(img, offset=part_offset)
+                    fs, _fs_offset = self._open_fs_smart(img, src, int(part_offset), label="Recover")
                     exporter = RobustExporter(fs, self.state, log_cb=self._log)
 
                     def progress(file_off: int, file_size: int) -> None:
