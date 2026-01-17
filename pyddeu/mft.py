@@ -85,7 +85,7 @@ def _parse_file_name_attr(buf: bytes, value_off: int, value_len: int) -> Optiona
         return None
     parent_ref = struct.unpack_from("<Q", buf, value_off)[0] & 0xFFFFFFFFFFFF
     name_len = buf[value_off + 64]
-    name_ns = buf[value_off + 65]
+    name_ns = buf[value_off + 65]  # 0=POSIX, 1=Win32, 2=DOS, 3=Win32&DOS
     if name_len == 0:
         return None
     name_off = value_off + 66
@@ -96,8 +96,8 @@ def _parse_file_name_attr(buf: bytes, value_off: int, value_len: int) -> Optiona
         name = ""
     if not name:
         return None
-    _ = name_ns
-    return MftFileName(name=name, parent_ref=int(parent_ref))
+    return MftFileName(name=name, parent_ref=int(parent_ref), namespace=int(name_ns))
+
 
 
 def _parse_resident_data(buf: bytes, value_off: int, value_len: int) -> bytes:
@@ -237,14 +237,32 @@ def build_paths(records: list[MftRecordSummary]) -> dict[int, str]:
     """
     Build best-effort full paths using Parent Directory references from FILE_NAME.
     This is a simplified DMDE-like reconstruction (no index parsing).
+    Prefers Win32 long names over DOS 8.3 short names.
     """
     name_by_inode: dict[int, str] = {}
     parent_by_inode: dict[int, int] = {}
 
+    def pick_best_name(file_names: list[MftFileName]) -> str:
+        """
+        Pick the best file name from available options.
+        Priority: Win32 (ns=1) > Win32&DOS (ns=3) > POSIX (ns=0) > DOS (ns=2)
+        DOS names (8.3 format like MEHMET~1) should be last resort.
+        """
+        if not file_names:
+            return ""
+        
+        # Sort by preference: Win32 first, DOS last
+        # namespace: 0=POSIX, 1=Win32, 2=DOS, 3=Win32&DOS
+        priority = {1: 0, 3: 1, 0: 2, 2: 3}  # Lower is better
+        sorted_names = sorted(file_names, key=lambda fn: priority.get(fn.namespace, 99))
+        
+        # Return the best (first) name
+        return sorted_names[0].name
+
     for r in records:
         if r.file_names:
-            # Prefer the first file name (often Win32) for display.
-            name_by_inode[r.inode] = r.file_names[0].name
+            # Prefer Win32 long name over DOS 8.3 short name
+            name_by_inode[r.inode] = pick_best_name(r.file_names)
         if r.parent_ref is not None:
             parent_by_inode[r.inode] = int(r.parent_ref)
 
@@ -267,6 +285,7 @@ def build_paths(records: list[MftRecordSummary]) -> dict[int, str]:
         return "/".join(parts) if parts else f"inode_{inode}"
 
     return {r.inode: resolve(r.inode) for r in records}
+
 
 
 def scan_and_parse_mft(

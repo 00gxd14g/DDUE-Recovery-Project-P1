@@ -258,6 +258,7 @@ class PyDDEUGui:
 
         self.var_skip_archives = tk.BooleanVar(value=True)
         self.var_skip_existing = tk.BooleanVar(value=True)
+        self.var_skip_videos = tk.BooleanVar(value=True)  # Skip large video files
         self.var_export_deleted = tk.BooleanVar(value=True)
         self.var_export_active = tk.BooleanVar(value=True)
 
@@ -270,6 +271,9 @@ class PyDDEUGui:
         )
         filter_opts_menu.add_checkbutton(
             label="Skip existing (already recovered)", variable=self.var_skip_existing
+        )
+        filter_opts_menu.add_checkbutton(
+            label="Skip videos (.mp4/.avi/.mkv/...)", variable=self.var_skip_videos
         )
         filter_opts_menu.add_separator()
         filter_opts_menu.add_checkbutton(label="Include Deleted", variable=self.var_export_deleted)
@@ -2541,6 +2545,16 @@ class PyDDEUGui:
             errors = 0
             total = len(file_nodes)
             src = None
+            
+            # Read filter options
+            skip_videos = bool(self.var_skip_videos.get())
+            skip_archives = bool(self.var_skip_archives.get())
+            skip_existing = bool(self.var_skip_existing.get())
+            try:
+                max_mb = int(self.entry_max_mb.get().strip() or "512")
+            except Exception:
+                max_mb = 512
+            max_bytes = max_mb * 1024 * 1024
 
             try:
                 src = open_source(self.source_path, config=self.config)
@@ -2559,7 +2573,25 @@ class PyDDEUGui:
                             item_text = self.tree.item(nid, "text")
                             rel = _normalize_rel_path(item_text) or f"file_{idx}"
 
+                        # Skip video files if option enabled
+                        if skip_videos and _is_video_path(rel):
+                            skipped += 1
+                            self._log("DEBUG", f"Video atlandı: {rel}")
+                            continue
+
+                        # Skip archive files if option enabled
+                        if skip_archives and _is_archive_path(rel):
+                            skipped += 1
+                            self._log("DEBUG", f"Arşiv atlandı: {rel}")
+                            continue
+
                         target = self.output_root / rel
+                        
+                        # Skip existing files if option enabled
+                        if skip_existing and target.exists():
+                            skipped += 1
+                            continue
+
                         target.parent.mkdir(parents=True, exist_ok=True)
 
                         # Update status
@@ -2714,6 +2746,35 @@ def _is_archive_path(rel: str) -> bool:
     if "." not in name:
         return False
     return name.rsplit(".", 1)[-1] in _ARCHIVE_EXTS
+
+
+# Video file extensions (typically very large, often not needed for recovery)
+_VIDEO_EXTS = {
+    "mp4",
+    "avi",
+    "mkv",
+    "mov",
+    "wmv",
+    "flv",
+    "webm",
+    "m4v",
+    "mpeg",
+    "mpg",
+    "3gp",
+    "3g2",
+    "ts",
+    "mts",
+    "m2ts",
+    "vob",
+    "ogv",
+}
+
+
+def _is_video_path(rel: str) -> bool:
+    name = Path(rel).name.lower()
+    if "." not in name:
+        return False
+    return name.rsplit(".", 1)[-1] in _VIDEO_EXTS
 
 
 def _should_skip_existing(path: Path, expected_size: int) -> bool:
