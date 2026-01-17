@@ -1027,66 +1027,75 @@ class PyDDEUGui:
             base_offset = int(part.start_offset)
             part_start_offset = base_offset
 
-            # Prefer cached boot info but still try to locate a readable boot near the selection
-            # (handles off-by-one and weak-media cases).
+            # Prefer cached boot info from Smart Scan - it already correctly identified
+            # which boot sector belongs to this partition (primary or backup normalized).
             boot = part.ntfs_boot
+            boot_at_offset: int | None = None
+            
             if boot:
                 self._log("INFO", "Using cached NTFS boot info from Smart Scan.")
-
-            boot_at_offset: int | None = None
-
-            # Try primary boot, then backup boot near the end (DMDE "~x C" case),
-            # and also "next partition start - 1 sector" as a backup-boot heuristic.
-            try_offsets: list[int] = [base_offset, base_offset + 512, base_offset - 512]
-
-            if int(getattr(part, "length", 0) or 0) > 0:
-                end_off = int(base_offset + int(part.length) - 512)
-                try_offsets.extend([end_off, end_off - 512, end_off + 512])
-
-            try:
-                next_start = min(
-                    int(p.start_offset)
-                    for p in (self.partitions or [])
-                    if int(p.start_offset) > base_offset
-                )
-                guess_backup = int(next_start - 512)
-                try_offsets.extend([guess_backup, guess_backup - 512, guess_backup + 512])
-            except Exception:
-                pass
-
-            # De-dup while preserving order and keeping offsets in range.
-            disk_size = 0
-            try:
-                disk_size = int(src.size() or 0)
-            except Exception:
-                disk_size = 0
-            seen_offs: set[int] = set()
-            ordered_offs: list[int] = []
-            for off in try_offsets:
-                off = int(off)
-                if off < 0:
-                    continue
-                if disk_size > 0 and off >= disk_size:
-                    continue
-                if off in seen_offs:
-                    continue
-                seen_offs.add(off)
-                ordered_offs.append(off)
-
-            for off in ordered_offs:
-                if off < 0:
-                    continue
-                boot_buf = safe_read_granular(src, self.state, int(off), 512, log_cb=None)
-                parsed = parse_ntfs_boot_sector(boot_buf) if boot_buf else None
-                if parsed:
-                    boot = parsed
-                    boot_at_offset = int(off)
-                    if off != base_offset:
-                        self._log("WARNING", f"{prefix}Using NTFS boot from offset {off} (primary unreadable?)")
-                    break
-
-            if boot and boot_at_offset is None:
+                # Trust the partition's start_offset - Smart Scan already normalized it
                 boot_at_offset = base_offset
+            else:
+                # No cached boot - try to locate a readable boot near the selection
+                # (handles off-by-one and weak-media cases).
+                # Try primary boot, then backup boot near the end (DMDE "~x C" case),
+                # and also "next partition start - 1 sector" as a backup-boot heuristic.
+                # NOTE: Do NOT try base_offset - 512 first as that may find a DIFFERENT
+                # partition's backup boot (e.g., when partitions are adjacent).
+                try_offsets: list[int] = [base_offset, base_offset + 512]
+
+                if int(getattr(part, "length", 0) or 0) > 0:
+                    end_off = int(base_offset + int(part.length) - 512)
+                    try_offsets.extend([end_off, end_off - 512, end_off + 512])
+
+                try:
+                    next_start = min(
+                        int(p.start_offset)
+                        for p in (self.partitions or [])
+                        if int(p.start_offset) > base_offset
+                    )
+                    guess_backup = int(next_start - 512)
+                    try_offsets.extend([guess_backup, guess_backup - 512, guess_backup + 512])
+                except Exception:
+                    pass
+                
+                # Only add base_offset - 512 as last resort
+                try_offsets.append(base_offset - 512)
+
+                # De-dup while preserving order and keeping offsets in range.
+                disk_size = 0
+                try:
+                    disk_size = int(src.size() or 0)
+                except Exception:
+                    disk_size = 0
+                seen_offs: set[int] = set()
+                ordered_offs: list[int] = []
+                for off in try_offsets:
+                    off = int(off)
+                    if off < 0:
+                        continue
+                    if disk_size > 0 and off >= disk_size:
+                        continue
+                    if off in seen_offs:
+                        continue
+                    seen_offs.add(off)
+                    ordered_offs.append(off)
+
+                for off in ordered_offs:
+                    if off < 0:
+                        continue
+                    boot_buf = safe_read_granular(src, self.state, int(off), 512, log_cb=None)
+                    parsed = parse_ntfs_boot_sector(boot_buf) if boot_buf else None
+                    if parsed:
+                        boot = parsed
+                        boot_at_offset = int(off)
+                        if off != base_offset:
+                            self._log("WARNING", f"{prefix}Using NTFS boot from offset {off} (primary unreadable?)")
+                        break
+
+                if boot and boot_at_offset is None:
+                    boot_at_offset = base_offset
                 
             if not boot:
                 self._log("CRITICAL", "Selected partition does not look like NTFS boot sector.")
@@ -1096,11 +1105,14 @@ class PyDDEUGui:
 
             # If we found a boot sector at a non-aligned LBA, it may be the NTFS backup boot
             # (last sector of the volume). Derive the real start so MFT offsets are correct.
-            if boot_at_offset is not None:
+            # Only re-derive start offset if we had to re-probe (no cached boot).
+            # When we have cached boot info, Smart Scan already normalized the start.
+            if boot_at_offset is not None and not part.ntfs_boot:
                 lba_hit = int(boot_at_offset // 512)
                 vol_lba512 = int(boot.volume_size_bytes // 512) if boot.volume_size_bytes > 0 else 0
                 if vol_lba512 > 0:
-                    start_lba = int(lba_hit - vol_lba512 + 1)
+                    # NTFS stores total_sectors = end_lba - start_lba (no +1)
+                    start_lba = int(lba_hit - vol_lba512)
                     if 0 <= start_lba < lba_hit and (lba_hit % 2048) != 0:
                         part_start_offset = int(start_lba * 512)
                     else:
