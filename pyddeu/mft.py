@@ -22,6 +22,7 @@ class MftCandidate:
 class MftFileName:
     name: str
     parent_ref: int
+    namespace: int = 0  # 0=POSIX, 1=Win32, 2=DOS, 3=Win32&DOS
 
 
 @dataclass(frozen=True)
