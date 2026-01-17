@@ -236,6 +236,7 @@ def _normalize_ntfs_start_lba(
     state: Optional[RecoveryState] = None,
     lba_size: int = DEFAULT_SECTOR_SIZE,
     preferred_starts: Optional[set[int]] = None,
+    log_cb: Optional[Callable[[str, str], None]] = None,
 ) -> int:
     """
     If an NTFS boot sector is found at the *backup boot* location (end of volume),
@@ -250,6 +251,8 @@ def _normalize_ntfs_start_lba(
 
     start = int(lba_hit - total_lba512 + 1)
     if start < 0 or start >= int(lba_hit):
+        if log_cb:
+            log_cb("DEBUG", f"  Normalize: lba_hit={lba_hit} total_lba512={total_lba512} → start={start} (invalid, keeping lba_hit)")
         return int(lba_hit)
 
     # If the hit itself looks like an aligned partition start, assume it is the start.
@@ -359,11 +362,15 @@ def scan_partitions(
         2048,        # Windows 7+ 1MB alignment (System Reserved typically starts here)
         2952,        # Alternate NTFS boot candidate seen on some disks (DMDE may list)
         104448,      # Common start after 50MB System Reserved
-        206848,      # Common start after 100MB System Reserved  
+        206848,      # Common start after 100MB System Reserved
         264192,      # Another common alignment
+        326634190,   # Known backup boot LBA (167GB bounded variant)
         326635520,   # Known from user's DMDE output
+        327679999,   # Backup boot of 535MB partition (LBA 326635520..327679999)
         327680000,   # Near 160GB (common partition boundary)
+        327682047,   # CRITICAL: Backup boot of 168GB partition (LBA 104448..327682047)
         327682048,   # Known from user's DMDE output - $Noname 03 (TARGET!)
+        500115455,   # Backup boot of 88.3GB partition (LBA 327682048..500115455)
         409640,      # ~200MB offset
     ]
     preferred_starts = set(initial_lbas)
@@ -407,6 +414,9 @@ def scan_partitions(
         # Check NTFS
         parsed_ntfs = parse_ntfs_boot_sector(data)
         if parsed_ntfs and parsed_ntfs.total_sectors > 0:
+            if log_cb:
+                vol_gb = parsed_ntfs.volume_size_bytes / (1024**3)
+                log_cb("DEBUG", f"  NTFS boot at LBA {lba}: bps={parsed_ntfs.bytes_per_sector} total={parsed_ntfs.total_sectors} vol={vol_gb:.2f}GB")
             start_lba = _normalize_ntfs_start_lba(
                 src,
                 int(lba),
@@ -414,6 +424,7 @@ def scan_partitions(
                 state=state,
                 lba_size=lba_size,
                 preferred_starts=preferred_starts,
+                log_cb=log_cb,
             )
             if start_lba != int(lba) and log_cb:
                 log_cb("DEBUG", f"NTFS boot hit @LBA {lba} looks like backup; using start LBA {start_lba}")
