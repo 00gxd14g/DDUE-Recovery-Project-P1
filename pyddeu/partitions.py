@@ -249,7 +249,7 @@ def _normalize_ntfs_start_lba(
     if total_lba512 <= 0:
         return int(lba_hit)
 
-    start = int(lba_hit - total_lba512 + 1)
+    start = int(lba_hit - total_lba512)
     if start < 0 or start >= int(lba_hit):
         if log_cb:
             log_cb("DEBUG", f"  Normalize: lba_hit={lba_hit} total_lba512={total_lba512} → start={start} (invalid, keeping lba_hit)")

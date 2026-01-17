@@ -69,7 +69,8 @@ class TestPartitionScanNormalization(unittest.TestCase):
         # of a volume starting at LBA 2048. 409640 is one of the DMDE-style probe LBAs.
         start_lba = 2048
         backup_lba = 409640
-        total_sectors = backup_lba - start_lba + 1
+        # NTFS stores total_sectors = (end_lba - start_lba), NOT (end - start + 1)
+        total_sectors = backup_lba - start_lba
 
         boot = _make_ntfs_boot_sector(total_sectors=total_sectors)
         src = _FakeDiskSource(
