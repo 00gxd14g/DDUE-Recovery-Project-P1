@@ -454,6 +454,10 @@ def scan_partitions(
                 next_lba = lba + s_len
                 if next_lba not in seen_lbas:
                     candidates.append(next_lba)
+                # Add ±1 for backup boot / off-by-one detection (like NTFS).
+                for adj in (next_lba - 1, next_lba + 1):
+                    if adj >= 0 and adj not in seen_lbas:
+                        candidates.append(adj)
 
         # Check exFAT
         elif _is_exfat_boot(data[:512]):
@@ -467,7 +471,11 @@ def scan_partitions(
                 next_lba = lba + s_len
                 if next_lba not in seen_lbas:
                     candidates.append(next_lba)
-        
+                # Add ±1 for backup boot / off-by-one detection (like NTFS).
+                for adj in (next_lba - 1, next_lba + 1):
+                    if adj >= 0 and adj not in seen_lbas:
+                        candidates.append(adj)
+
         if found_len > 0:
             # We found something valid!
             key = (int(offset), int(found_len), str(p_type))

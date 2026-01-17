@@ -109,6 +109,7 @@ def parse_mft_record_best_effort(
     *,
     record_offset: int,
     mft_record_number: Optional[int] = None,
+    record_size: int = 1024,
 ) -> Optional[MftRecordSummary]:
     """
     Best-effort NTFS MFT record parser (no fixup/USN repair).
@@ -116,12 +117,13 @@ def parse_mft_record_best_effort(
       - $FILE_NAME (0x30) extraction
       - resident $DATA (0x80) extraction (small files)
       - deletion heuristic: flags == 0 or !in-use bit
-    
+
     Args:
         record: Raw MFT record bytes
         record_offset: Absolute disk offset where record was read
         mft_record_number: If known, the actual MFT record index (inode).
                           If None, will be guessed from record_offset.
+        record_size: MFT record size from boot sector (default 1024).
     """
     if len(record) < 48:
         return None
@@ -184,7 +186,8 @@ def parse_mft_record_best_effort(
     if mft_record_number is not None:
         inode = int(mft_record_number)
     else:
-        inode = record_offset // 1024 if record_offset >= 0 else 0
+        rs = int(record_size) if record_size > 0 else 1024
+        inode = record_offset // rs if record_offset >= 0 else 0
         
     return MftRecordSummary(
         record_offset=record_offset,
@@ -293,6 +296,6 @@ def scan_and_parse_mft(
             except Exception:
                 pass
         rec = safe_read(src, state, cand.offset, record_size, log_cb=log_cb)
-        summary = parse_mft_record_best_effort(rec, record_offset=cand.offset)
+        summary = parse_mft_record_best_effort(rec, record_offset=cand.offset, record_size=record_size)
         if summary and (summary.file_names or summary.resident_data is not None):
             yield summary
