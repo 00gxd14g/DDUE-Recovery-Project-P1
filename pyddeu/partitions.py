@@ -14,7 +14,9 @@ from .state import RecoveryState
 from .config import PyddeuConfig
 
 
-DEFAULT_SECTOR_SIZE = 512
+# DMDE/MBR/GPT "LBA" addressing is always 512 bytes, even on 4K devices.
+LBA_SIZE = 512
+DEFAULT_SECTOR_SIZE = LBA_SIZE
 _MBR_SIG = b"\x55\xAA"
 
 
@@ -204,6 +206,80 @@ class _NullState:
 _NULL_STATE = _NullState()
 
 
+def _ntfs_volume_lba512(boot: NtfsBoot) -> int:
+    """
+    Return NTFS volume size in 512-byte LBA units.
+
+    NTFS boot sectors store total size in units of bytes_per_sector; for DMDE-like
+    probing we express everything as 512-byte LBAs.
+    """
+    try:
+        bps = int(boot.bytes_per_sector)
+        total = int(boot.total_sectors)
+    except Exception:
+        return 0
+    if bps <= 0 or total <= 0:
+        return 0
+    if bps % DEFAULT_SECTOR_SIZE != 0:
+        return 0
+    mult = bps // DEFAULT_SECTOR_SIZE
+    if mult <= 0:
+        return 0
+    return total * mult
+
+
+def _normalize_ntfs_start_lba(
+    src: DiskSource,
+    lba_hit: int,
+    boot: NtfsBoot,
+    *,
+    state: Optional[RecoveryState] = None,
+    lba_size: int = DEFAULT_SECTOR_SIZE,
+    preferred_starts: Optional[set[int]] = None,
+) -> int:
+    """
+    If an NTFS boot sector is found at the *backup boot* location (end of volume),
+    compute and return the real start LBA.
+
+    This avoids common off-by-one issues where the last sector of a volume is
+    misinterpreted as the partition start (pytsk3 can't mount from a backup boot).
+    """
+    total_lba512 = _ntfs_volume_lba512(boot)
+    if total_lba512 <= 0:
+        return int(lba_hit)
+
+    start = int(lba_hit - total_lba512 + 1)
+    if start < 0 or start >= int(lba_hit):
+        return int(lba_hit)
+
+    # If the hit itself looks like an aligned partition start, assume it is the start.
+    if int(lba_hit) % 2048 == 0:
+        return int(lba_hit)
+
+    # Strong confirmation: the computed start also parses as NTFS.
+    try:
+        buf = safe_read_granular(
+            src,
+            state or _NULL_STATE,
+            start * int(lba_size),
+            512,
+            log_cb=None,
+            sector_size=int(lba_size),
+        )
+        if buf and parse_ntfs_boot_sector(buf):
+            return start
+    except Exception:
+        pass
+
+    # Weak-media fallback: accept plausible/known starts even if unreadable.
+    if start % 2048 == 0:
+        return start
+    if preferred_starts and start in preferred_starts:
+        return start
+
+    return int(lba_hit)
+
+
 def scan_partitions(
     src: DiskSource,
     *,
@@ -272,6 +348,7 @@ def scan_partitions(
         log_cb("WARNING", "Partition table not found. Starting Smart Quick Scan (Chain Probing)...")
 
     found_parts: list[Partition] = []
+    seen_part_keys: set[tuple[int, int, str]] = set()
     
     # Priority queue of LBAs to check. 
     # We use a set for visited to avoid loops/dups.
@@ -289,8 +366,16 @@ def scan_partitions(
         327682048,   # Known from user's DMDE output - $Noname 03 (TARGET!)
         409640,      # ~200MB offset
     ]
+    preferred_starts = set(initial_lbas)
     
-    candidates = sorted(set(initial_lbas))
+    # Probe around known starts as well: many NTFS backup boot sectors sit at (next_start - 1).
+    seed: set[int] = set()
+    for base in initial_lbas:
+        for delta in (-1, 0, 1):
+            v = int(base + delta)
+            if v >= 0:
+                seed.add(v)
+    candidates = sorted(seed)
     seen_lbas: set[int] = set()
     
     idx_found = 1
@@ -322,7 +407,21 @@ def scan_partitions(
         # Check NTFS
         parsed_ntfs = parse_ntfs_boot_sector(data)
         if parsed_ntfs and parsed_ntfs.total_sectors > 0:
-            found_len = parsed_ntfs.volume_size_bytes
+            start_lba = _normalize_ntfs_start_lba(
+                src,
+                int(lba),
+                parsed_ntfs,
+                state=state,
+                lba_size=lba_size,
+                preferred_starts=preferred_starts,
+            )
+            if start_lba != int(lba) and log_cb:
+                log_cb("DEBUG", f"NTFS boot hit @LBA {lba} looks like backup; using start LBA {start_lba}")
+
+            offset = int(start_lba) * lba_size
+            found_len = int(parsed_ntfs.volume_size_bytes)
+            if disk_size > 0:
+                found_len = int(min(found_len, max(0, disk_size - offset)))
             # Convert to 512-byte LBA units regardless of NTFS bytes-per-sector.
             s_len = int(found_len // lba_size) if found_len > 0 else 0
             p_type = "NTFS (Smart Scan)"
@@ -330,7 +429,7 @@ def scan_partitions(
             cached_ntfs_boot = parsed_ntfs  # Cache for later use in deep scan
             
             # CHAIN: Add next partition start
-            next_lba = int(lba + s_len) if s_len > 0 else int(lba)
+            next_lba = int(start_lba + s_len) if s_len > 0 else int(start_lba)
             if next_lba not in seen_lbas:
                 candidates.append(next_lba)
                 # Sometimes there's a 1MB alignment gap (2048 sectors)
@@ -338,6 +437,10 @@ def scan_partitions(
                 aligned_next = ((next_lba + 2047) // 2048) * 2048
                 if aligned_next != next_lba and aligned_next not in seen_lbas:
                      candidates.append(aligned_next)
+                # Also probe around the boundary (end sector / off-by-one / backup boot).
+                for adj in (next_lba - 1, next_lba + 1):
+                    if adj >= 0 and adj not in seen_lbas:
+                        candidates.append(adj)
 
         # Check FAT32
         elif _is_fat32_boot(data[:512]):
@@ -367,16 +470,21 @@ def scan_partitions(
         
         if found_len > 0:
             # We found something valid!
-            found_parts.append(Partition(
-                index=idx_found,
-                start_offset=offset,
-                length=found_len,
-                scheme="FOUND",
-                type_str=p_type,
-                name=p_name,
-                ntfs_boot=cached_ntfs_boot,  # Save cached NTFS boot info
-            ))
-            idx_found += 1
+            key = (int(offset), int(found_len), str(p_type))
+            if key not in seen_part_keys:
+                seen_part_keys.add(key)
+                found_parts.append(
+                    Partition(
+                        index=idx_found,
+                        start_offset=int(offset),
+                        length=int(found_len),
+                        scheme="FOUND",
+                        type_str=p_type,
+                        name=p_name,
+                        ntfs_boot=cached_ntfs_boot,  # Save cached NTFS boot info
+                    )
+                )
+                idx_found += 1
             # Sort candidates to prioritize lower LBAs (sequential scan)
             candidates.sort()
 
