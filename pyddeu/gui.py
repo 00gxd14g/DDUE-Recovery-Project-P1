@@ -158,6 +158,7 @@ class PyDDEUGui:
         actions_menu.add_separator()
         actions_menu.add_command(label="Select Missing Files", command=self.action_select_missing)
         actions_menu.add_command(label="Recover Selected", command=self.action_recover_selected)
+        actions_menu.add_command(label="Recover Folder", command=self.action_recover_folder)
         actions_menu.add_command(label="Select All", command=self.action_select_all)
         actions_menu.add_command(label="Clear Selection", command=self.action_clear_selection)
         actions_menu.add_separator()
@@ -204,6 +205,9 @@ class PyDDEUGui:
 
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(label="Recover selected file", command=self.recover_selected_file)
+        self.context_menu.add_command(label="Recover folder (all files)", command=self.action_recover_folder)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Select all in folder", command=self.action_select_folder_contents)
         self.tree.bind("<Button-3>", self.show_context_menu)
 
         log_frame = ttk.LabelFrame(self.root, text="Log", height=150)
@@ -2426,6 +2430,210 @@ class PyDDEUGui:
         """Tüm seçimi temizler."""
         self.tree.selection_remove(*self.tree.selection())
         self._log("INFO", "Seçim temizlendi.")
+
+    def _get_all_descendants(self, node_id: str) -> list[str]:
+        """Recursively get all descendant node IDs of a tree node."""
+        descendants = []
+        children = self.tree.get_children(node_id)
+        for child in children:
+            descendants.append(child)
+            descendants.extend(self._get_all_descendants(child))
+        return descendants
+
+    def action_select_folder_contents(self) -> None:
+        """Seçili klasörün tüm içeriğini seçer."""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Select Folder", "Önce bir klasör seçin.")
+            return
+        
+        node_id = sel[0]
+        # Check if it's a folder node
+        children = self.tree.get_children(node_id)
+        if not children:
+            # It's a file, try to find parent folder
+            parent = self.tree.parent(node_id)
+            if parent:
+                node_id = parent
+                children = self.tree.get_children(node_id)
+        
+        if not children:
+            messagebox.showinfo("Select Folder", "Seçilen öğe bir klasör değil.")
+            return
+        
+        # Get all descendants
+        all_items = self._get_all_descendants(node_id)
+        if all_items:
+            self.tree.selection_set(all_items)
+            self._log("INFO", f"Klasördeki {len(all_items)} öğe seçildi.")
+
+    def action_recover_folder(self) -> None:
+        """
+        Seçili klasör ve altındaki tüm dosyaları kurtarır.
+        Klasör yapısını koruyarak output_root altına kaydeder.
+        """
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Recover Folder", "Önce bir klasör veya dosya seçin.")
+            return
+
+        node_id = sel[0]
+        
+        # Determine folder - if file selected, use its parent
+        children = self.tree.get_children(node_id)
+        folder_node = node_id
+        if not children:
+            parent = self.tree.parent(node_id)
+            if parent:
+                folder_node = parent
+        
+        # Get folder path for display
+        folder_path = self._full_path_cache.get(folder_node, "") if hasattr(self, "_full_path_cache") else ""
+        if not folder_path:
+            folder_path = self.tree.item(folder_node, "text")
+        
+        # Get all file nodes under this folder
+        all_descendants = [folder_node] + self._get_all_descendants(folder_node)
+        file_nodes = []
+        for nid in all_descendants:
+            meta = self.node_metadata.get(nid)
+            if meta:
+                _, _, is_dir = meta
+                if not is_dir:
+                    file_nodes.append(nid)
+            else:
+                # Check if it has no children (leaf = file)
+                if not self.tree.get_children(nid):
+                    # Also check if it's in nonresident or resident cache
+                    if nid in getattr(self, "_resident_cache", {}) or nid in getattr(self, "_nonresident_cache", {}):
+                        file_nodes.append(nid)
+
+        if not file_nodes:
+            messagebox.showinfo("Recover Folder", "Klasörde kurtarılacak dosya bulunamadı.")
+            return
+
+        try:
+            self.output_root = Path(self.entry_output.get().strip())
+        except Exception:
+            pass
+        if not self.output_root:
+            messagebox.showerror("Recover Folder", "Önce bir çıktı klasörü seçin.")
+            return
+
+        if not self.source:
+            messagebox.showerror("Recover Folder", "Önce bir disk/imaj bağlayın.")
+            return
+
+        confirm = messagebox.askyesno(
+            "Recover Folder",
+            f"Klasör: {folder_path}\n\n{len(file_nodes)} dosya kurtarılacak.\n\nDevam etmek istiyor musunuz?"
+        )
+        if not confirm:
+            return
+
+        self.state.stop_requested = False
+        self._status_text = f"Klasör kurtarılıyor: {folder_path}"
+        self._status_pct = 0
+
+        def worker() -> None:
+            exported = 0
+            skipped = 0
+            errors = 0
+            total = len(file_nodes)
+            src = None
+
+            try:
+                src = open_source(self.source_path, config=self.config)
+                img = DDEUImg(src, self.state, log_cb=self._log)
+                exporter_cache: dict[int, RobustExporter] = {}
+
+                for idx, nid in enumerate(file_nodes, start=1):
+                    if self.state.stop_requested or not self.state.is_alive:
+                        self._log("WARNING", "Kurtarma işlemi durduruldu.")
+                        break
+
+                    try:
+                        # Get full path for proper directory structure
+                        rel = self._full_path_cache.get(nid) if hasattr(self, "_full_path_cache") else None
+                        if not rel:
+                            item_text = self.tree.item(nid, "text")
+                            rel = _normalize_rel_path(item_text) or f"file_{idx}"
+
+                        target = self.output_root / rel
+                        target.parent.mkdir(parents=True, exist_ok=True)
+
+                        # Update status
+                        self._status_text = f"Kurtarılıyor: {Path(rel).name} ({idx}/{total})"
+                        self._status_pct = int((idx / total) * 100)
+
+                        # Try resident data first
+                        resident = self._resident_cache.get(nid) if hasattr(self, "_resident_cache") else None
+                        if resident is not None:
+                            target.write_bytes(resident)
+                            exported += 1
+                            self._log("INFO", f"Kurtarıldı (resident): {target}")
+                            continue
+
+                        # Try non-resident data runs
+                        nonres = self._nonresident_cache.get(nid) if hasattr(self, "_nonresident_cache") else None
+                        if nonres is not None:
+                            part_off, cluster_size, runs, expected = nonres
+                            recover_nonresident_runs(
+                                src,
+                                self.state,
+                                target,
+                                part_offset=part_off,
+                                cluster_size=cluster_size,
+                                runs=runs,
+                                expected_size=expected,
+                                log_cb=self._log,
+                            )
+                            exported += 1
+                            self._log("INFO", f"Kurtarıldı (non-resident): {target}")
+                            continue
+
+                        # Fall back to pytsk3 export if we have metadata
+                        meta = self.node_metadata.get(nid)
+                        if meta:
+                            part_offset, inode, _ = meta
+                            exporter = exporter_cache.get(int(part_offset))
+                            if exporter is None:
+                                try:
+                                    fs = pytsk3.FS_Info(img, offset=int(part_offset))
+                                    exporter = RobustExporter(fs, self.state, log_cb=self._log)
+                                    exporter_cache[int(part_offset)] = exporter
+                                except Exception:
+                                    skipped += 1
+                                    continue
+
+                            ok = exporter.export_inode(inode, target)
+                            if ok:
+                                exported += 1
+                                self._log("INFO", f"Kurtarıldı: {target}")
+                            else:
+                                errors += 1
+                                self._log("WARNING", f"Kurtarılamadı: {rel}")
+                        else:
+                            skipped += 1
+                            self._log("DEBUG", f"Metadata yok, atlandı: {rel}")
+
+                    except Exception as e:
+                        errors += 1
+                        self._log("ERROR", f"Kurtarma hatası: {e}")
+
+            except Exception as e:
+                self._log("CRITICAL", f"Klasör kurtarma başarısız: {e}")
+            finally:
+                try:
+                    if src is not None:
+                        src.close()
+                except Exception:
+                    pass
+                self._log("INFO", f"=== KLASÖR KURTARMA TAMAMLANDI === Başarılı: {exported}, Atlanan: {skipped}, Hatalı: {errors}")
+                self._status_text = f"Klasör kurtarma tamamlandı (ok={exported} err={errors})"
+                self._status_pct = 100
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 def _normalize_rel_path(item_text: str) -> str:
