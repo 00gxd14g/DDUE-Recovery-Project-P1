@@ -59,9 +59,10 @@ def parse_ntfs_boot_sector(buf: bytes) -> Optional[NtfsBoot]:
     total_clusters = int(total // spc) if spc > 0 else 0
     if total_clusters <= 0:
         return None
-    if mft_lcn <= 0 or mft_lcn >= total_clusters:
+    # MFT is never at cluster 0 (boot area); use < 1 for clarity.
+    if mft_lcn < 1 or mft_lcn >= total_clusters:
         return None
-    if mftmirr_lcn <= 0 or mftmirr_lcn >= total_clusters:
+    if mftmirr_lcn < 1 or mftmirr_lcn >= total_clusters:
         return None
     return NtfsBoot(
         bytes_per_sector=bps,

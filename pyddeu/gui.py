@@ -1195,9 +1195,10 @@ class PyDDEUGui:
                                 
                             # Pass the actual MFT record number for proper inode assignment
                             summary = parse_mft_record_best_effort(
-                                rec_data, 
+                                rec_data,
                                 record_offset=offset,
-                                mft_record_number=mft_record_num
+                                mft_record_number=mft_record_num,
+                                record_size=boot.file_record_size,
                             )
                             if summary and (summary.file_names or summary.resident_data is not None):
                                 collected.append(summary)
@@ -1222,9 +1223,10 @@ class PyDDEUGui:
                             break
                             
                         summary = parse_mft_record_best_effort(
-                            rec_data, 
+                            rec_data,
                             record_offset=offset,
-                            mft_record_number=mft_record_num
+                            mft_record_number=mft_record_num,
+                            record_size=boot.file_record_size,
                         )
                         if summary and (summary.file_names or summary.resident_data is not None):
                             collected.append(summary)
