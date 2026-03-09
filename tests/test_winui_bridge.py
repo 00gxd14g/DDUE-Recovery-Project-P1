@@ -3,7 +3,8 @@ from __future__ import annotations
 import unittest
 
 from pyddeu.mft import MftFileName
-from pyddeu.winui_bridge import _make_file_item, _records_to_files, _safe_rel_path
+from pyddeu.partitions import Partition
+from pyddeu.winui_bridge import _decode_fs_entry_name, _make_file_item, _partition_to_json, _records_to_files, _safe_rel_path
 
 
 class _FakeRecord:
@@ -93,6 +94,25 @@ class TestWinuiBridgeHelpers(unittest.TestCase):
     def test_safe_rel_path_strips_prefixes_and_invalid_chars(self) -> None:
         rel = _safe_rel_path(r'[DEEP] /Users/Alice/Bad:Name?.txt')
         self.assertEqual(rel, "Users/Alice/Bad_Name_.txt")
+
+    def test_decode_fs_entry_name_handles_utf16le_name_bytes(self) -> None:
+        name = _decode_fs_entry_name("Microsoft XML".encode("utf-16le"))
+        self.assertEqual(name, "Microsoft XML")
+
+    def test_partition_to_json_prefers_detected_filesystem_name(self) -> None:
+        part = Partition(
+            index=1,
+            start_offset=4096,
+            length=1024 * 1024,
+            scheme="GPT",
+            type_str="GPT ebd0a0a2",
+            name="Data",
+        )
+
+        payload = _partition_to_json(part, filesystem_label="NTFS")
+
+        self.assertEqual(payload["filesystem"], "NTFS")
+        self.assertIn("NTFS", payload["type_str"])
 
 
 if __name__ == "__main__":

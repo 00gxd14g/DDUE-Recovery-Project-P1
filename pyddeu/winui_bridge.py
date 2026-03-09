@@ -99,14 +99,25 @@ def _read_payload_from_stdin() -> JsonObj:
     return data
 
 
-def _partition_to_json(p: Partition) -> JsonObj:
+def _decorate_partition_type(type_str: str, filesystem_label: str) -> str:
+    base = str(type_str or "")
+    fs = str(filesystem_label or "").strip()
+    if not fs:
+        return base
+    if fs.upper() in base.upper():
+        return base
+    return f"{base} ({fs})".strip()
+
+
+def _partition_to_json(p: Partition, *, filesystem_label: str = "") -> JsonObj:
     return {
         "index": int(p.index),
         "start_offset": int(p.start_offset),
         "length": int(p.length),
         "scheme": str(p.scheme or ""),
-        "type_str": str(p.type_str or ""),
+        "type_str": _decorate_partition_type(str(p.type_str or ""), filesystem_label),
         "name": str(p.name or ""),
+        "filesystem": str(filesystem_label or ""),
     }
 
 
@@ -137,6 +148,50 @@ def _normalize_display_path(path_text: str) -> tuple[str, str]:
         return "", ""
     normalized = "/".join(parts)
     return normalized, parts[-1]
+
+
+def _decode_fs_entry_name(name_bytes: bytes | bytearray | memoryview | None) -> str:
+    raw = bytes(name_bytes or b"")
+    if not raw:
+        return ""
+
+    candidates: list[str] = []
+    if b"\x00" in raw and len(raw) % 2 == 0:
+        try:
+            candidates.append(raw.decode("utf-16le", errors="strict"))
+        except Exception:
+            pass
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            candidates.append(raw.decode(encoding, errors="strict"))
+        except Exception:
+            continue
+
+    for candidate in candidates:
+        cleaned = "".join(ch for ch in candidate.replace("\x00", "") if ch >= " " or ch == "\t").strip()
+        if cleaned:
+            return cleaned
+
+    fallback = raw.decode("utf-8", errors="replace").replace("\x00", "").strip()
+    return "".join(ch for ch in fallback if ch >= " " or ch == "\t")
+
+
+def _detect_partition_filesystem(src: Any, partition: Partition, state: RecoveryState) -> str:
+    if getattr(partition, "ntfs_boot", None) is not None:
+        return "NTFS"
+
+    try:
+        boot = safe_read_granular(src, state, int(partition.start_offset), 512, log_cb=None)
+    except Exception:
+        return ""
+
+    if parse_ntfs_boot_sector(boot):
+        return "NTFS"
+    if len(boot) >= 512 and boot[3:11] == b"EXFAT   " and boot[510:512] == b"\x55\xAA":
+        return "exFAT"
+    if len(boot) >= 512 and boot[0x52:0x5A] == b"FAT32   " and boot[510:512] == b"\x55\xAA":
+        return "FAT32"
+    return ""
 
 
 def _pick_name_source(file_names: list[Any] | None) -> str:
@@ -274,6 +329,39 @@ def _command_list_disks(_: JsonObj) -> int:
     return _result({"command": "list_disks", "disks": disks})
 
 
+def _command_connect(payload: JsonObj) -> int:
+    source_path = str(payload.get("source_path") or "").strip()
+    if not source_path:
+        return _error("source_path is required", code="invalid_payload")
+
+    config = _load_config()
+    map_path = map_path_for_source(source_path)
+    state = RecoveryState(map_path=map_path)
+    src = None
+    try:
+        src = open_source(source_path, config=config)
+        size = int(src.size() or 0)
+        sector_size_fn = getattr(src, "sector_size", None)
+        sector_size = int(sector_size_fn() or 512) if callable(sector_size_fn) else 512
+        return _result(
+            {
+                "command": "connect",
+                "source_path": source_path,
+                "size": size,
+                "sector_size": sector_size,
+                "map_path": str(map_path),
+            }
+        )
+    except Exception as e:
+        return _error(f"connect failed: {e}", details=traceback.format_exc())
+    finally:
+        try:
+            if src is not None:
+                src.close()
+        except Exception:
+            pass
+
+
 def _command_scan_partitions(payload: JsonObj) -> int:
     source_path = str(payload.get("source_path") or "").strip()
     if not source_path:
@@ -339,10 +427,15 @@ def _command_scan_partitions(payload: JsonObj) -> int:
                 dedup.setdefault((int(p.start_offset), int(p.length)), p)
             parts = sorted(dedup.values(), key=lambda x: int(x.start_offset))
 
+        partitions_json = []
+        for part in parts:
+            filesystem_label = _detect_partition_filesystem(src, part, state)
+            partitions_json.append(_partition_to_json(part, filesystem_label=filesystem_label))
+
         return _result(
             {
                 "command": "scan_partitions",
-                "partitions": [_partition_to_json(p) for p in parts],
+                "partitions": partitions_json,
                 "count": len(parts),
             }
         )
@@ -860,7 +953,9 @@ def _command_parse_fs(payload: JsonObj) -> int:
                     name_bytes = entry.info.name.name
                     if not name_bytes:
                         continue
-                    name = name_bytes.decode("utf-8", errors="replace")
+                    name = _decode_fs_entry_name(name_bytes)
+                    if not name:
+                        continue
                     if name in _SKIP_NAMES:
                         continue
                     meta = entry.info.meta
@@ -1081,6 +1176,7 @@ def _command_stop(_: JsonObj) -> int:
 def _dispatch(command: str, payload: JsonObj) -> int:
     handlers: dict[str, Callable[[JsonObj], int]] = {
         "list_disks": _command_list_disks,
+        "connect": _command_connect,
         "scan_partitions": _command_scan_partitions,
         "deep_scan": _command_deep_scan,
         "mft_scan": _command_mft_scan,

@@ -129,6 +129,8 @@
                         IsDynamicOverflowEnabled="True" OverflowButtonVisibility="Auto">
                 <AppBarButton x:Name="ListDisksButton" Click="OnListDisksClicked"
                               Icon="Refresh" IsEnabled="{Binding CommandsEnabled}" Label="List Disks" />
+                <AppBarButton x:Name="ConnectDiskButton" Click="OnConnectClicked"
+                              Icon="Plug" IsEnabled="{Binding CommandsEnabled}" Label="Connect Disk" />
                 <AppBarButton x:Name="ScanPartitionsButton" Click="OnScanPartitionsClicked"
                               Icon="Find" IsEnabled="{Binding CommandsEnabled}" Label="Scan Partitions" />
                 <AppBarButton x:Name="DeepScanButton" Click="OnDeepScanClicked"

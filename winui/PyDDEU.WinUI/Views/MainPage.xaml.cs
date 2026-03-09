@@ -85,6 +85,11 @@ namespace PyDDEU.WinUI.Views
             }
         }
 
+        private async void OnConnectClicked(object sender, RoutedEventArgs e)
+        {
+            await ViewModel.ConnectAsync();
+        }
+
         private async void OnDeepScanClicked(object sender, RoutedEventArgs e)
         {
             await ViewModel.DeepScanAsync();

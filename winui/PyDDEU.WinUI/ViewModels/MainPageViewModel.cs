@@ -399,15 +399,17 @@ namespace PyDDEU.WinUI.ViewModels
                                     Length = ReadLong(o, "length"),
                                     Scheme = ReadString(o, "scheme"),
                                     TypeStr = ReadString(o, "type_str"),
+                                    Filesystem = ReadString(o, "filesystem"),
                                     Name = ReadString(o, "name"),
                                 }
                             );
                         }
                     }
 
-                    if (Partitions.Count > 0)
+                    var bestPartition = PickBestPartition(Partitions);
+                    if (bestPartition != null)
                     {
-                        SetSelectedPartition(Partitions[0]);
+                        SetSelectedPartition(bestPartition);
                     }
                     else
                     {
@@ -423,6 +425,40 @@ namespace PyDDEU.WinUI.ViewModels
             );
         }
 
+        public async Task ConnectAsync()
+        {
+            await RunCommandAsync(
+                "Connecting source...",
+                async token =>
+                {
+                    var source = RequireSourcePath();
+                    var payload = new JsonObject
+                    {
+                        ["source_path"] = source,
+                    };
+
+                    var result = await _bridge.ExecuteAsync("connect", payload, OnBridgeEventAsync, token);
+                    var size = ReadLong(result.Result, "size");
+                    var mapPath = ReadString(result.Result, "map_path");
+                    var sectorSize = ReadLong(result.Result, "sector_size");
+
+                    StatusText = "Connected: " + source;
+                    IsProgressIndeterminate = false;
+                    ProgressValue = 100;
+                    ProgressText = "100%";
+                    AddLog("INFO", string.Format("Connected: {0} ({1})", source, UiFormat.FormatBytes(size)));
+                    if (!string.IsNullOrWhiteSpace(mapPath))
+                    {
+                        AddLog("INFO", "Bad-region map: " + mapPath);
+                    }
+                    if (sectorSize > 0)
+                    {
+                        AddLog("INFO", "Sector size: " + sectorSize);
+                    }
+                }
+            );
+        }
+
         public async Task DeepScanAsync()
         {
             await RunCommandAsync(
@@ -430,16 +466,21 @@ namespace PyDDEU.WinUI.ViewModels
                 async token =>
                 {
                     var source = RequireSourcePath();
-                    if (_selectedPartition == null)
+                    var pickedPartition = _selectedPartition ?? PickBestPartition(Partitions);
+                    if (pickedPartition == null)
                     {
                         throw new InvalidOperationException("Select a partition first.");
+                    }
+                    if (_selectedPartition == null)
+                    {
+                        SetSelectedPartition(pickedPartition);
                     }
 
                     var payload = new JsonObject
                     {
                         ["source_path"] = source,
-                        ["partition_start"] = _selectedPartition.StartOffset,
-                        ["partition_length"] = _selectedPartition.Length,
+                        ["partition_start"] = pickedPartition.StartOffset,
+                        ["partition_length"] = pickedPartition.Length,
                         ["include_deleted"] = IncludeDeleted,
                         ["include_active"] = IncludeActive,
                         ["max_records"] = (int)Math.Clamp(MaxRecords, 100, 500000),
@@ -464,16 +505,21 @@ namespace PyDDEU.WinUI.ViewModels
                 async token =>
                 {
                     var source = RequireSourcePath();
-                    if (_selectedPartition == null)
+                    var pickedPartition = _selectedPartition ?? PickBestPartition(Partitions);
+                    if (pickedPartition == null)
                     {
                         throw new InvalidOperationException("Select a partition first.");
+                    }
+                    if (_selectedPartition == null)
+                    {
+                        SetSelectedPartition(pickedPartition);
                     }
 
                     var payload = new JsonObject
                     {
                         ["source_path"] = source,
-                        ["partition_start"] = _selectedPartition.StartOffset,
-                        ["partition_length"] = _selectedPartition.Length,
+                        ["partition_start"] = pickedPartition.StartOffset,
+                        ["partition_length"] = pickedPartition.Length,
                         ["max_entries"] = (int)Math.Clamp(MaxRecords, 100, 500000),
                     };
 
@@ -872,6 +918,35 @@ namespace PyDDEU.WinUI.ViewModels
             }
 
             return filters;
+        }
+
+        private PartitionInfoModel? PickBestPartition(IEnumerable<PartitionInfoModel> partitions)
+        {
+            var candidates = partitions?.ToList() ?? new List<PartitionInfoModel>();
+            if (candidates.Count == 0)
+            {
+                return null;
+            }
+
+            var ntfsCandidates = candidates
+                .Where(IsNtfsPartition)
+                .ToList();
+            if (ntfsCandidates.Count > 0)
+            {
+                candidates = ntfsCandidates;
+            }
+
+            return candidates
+                .OrderByDescending(part => IsNtfsPartition(part))
+                .ThenByDescending(part => part.Length)
+                .ThenBy(part => part.StartOffset)
+                .FirstOrDefault();
+        }
+
+        private static bool IsNtfsPartition(PartitionInfoModel partition)
+        {
+            var typeLabel = string.Format("{0} {1}", partition.TypeStr, partition.Filesystem);
+            return typeLabel.Contains("NTFS", StringComparison.OrdinalIgnoreCase);
         }
 
         private void UpdateProgress(long current, long total)

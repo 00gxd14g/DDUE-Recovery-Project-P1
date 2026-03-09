@@ -49,6 +49,7 @@ namespace PyDDEU.WinUI.Models
         public long Length { get; set; }
         public string Scheme { get; set; } = string.Empty;
         public string TypeStr { get; set; } = string.Empty;
+        public string Filesystem { get; set; } = string.Empty;
         public string Name { get; set; } = string.Empty;
 
         public double SizeGb
@@ -83,6 +84,10 @@ namespace PyDDEU.WinUI.Models
                 if (!string.IsNullOrWhiteSpace(Name))
                 {
                     label += " name=" + Name;
+                }
+                if (!string.IsNullOrWhiteSpace(Filesystem) && !label.Contains(Filesystem, StringComparison.OrdinalIgnoreCase))
+                {
+                    label += " fs=" + Filesystem;
                 }
                 return label;
             }

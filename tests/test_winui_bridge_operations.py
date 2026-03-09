@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from pyddeu import winui_bridge as bridge
+from pyddeu.partitions import Partition
 
 
 class _FakeSource:
@@ -52,7 +53,7 @@ class TestWinuiBridgeOperations(unittest.TestCase):
         self.assertEqual(self.events[-1]["command"], "scan_partitions")
         self.assertEqual(
             self.events[-1]["partitions"],
-            [{"index": 1, "start_offset": 2048, "length": 8192, "scheme": "GPT", "type_str": "Basic", "name": "Data"}],
+            [{"index": 1, "start_offset": 2048, "length": 8192, "scheme": "GPT", "type_str": "Basic", "name": "Data", "filesystem": ""}],
         )
 
     def test_list_disks_returns_result_shape(self) -> None:
@@ -238,6 +239,51 @@ class TestWinuiBridgeOperations(unittest.TestCase):
         self.assertEqual(self.events[-1]["command"], "mft_scan")
         self.assertEqual(self.events[-1]["count"], 1)
         self.assertEqual(self.events[-1]["raw_record_count"], 1)
+
+    def test_connect_returns_source_metadata(self) -> None:
+        source = _FakeSource(size=65536)
+
+        with patch.object(bridge, "open_source", return_value=source):
+            exit_code = bridge._command_connect({"source_path": "disk.img"})
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(source.closed)
+        self.assertEqual(self.events[-1]["type"], "result")
+        self.assertEqual(self.events[-1]["command"], "connect")
+        self.assertEqual(self.events[-1]["source_path"], "disk.img")
+        self.assertEqual(self.events[-1]["size"], 65536)
+
+    def test_scan_partitions_enriches_ntfs_filesystem_label(self) -> None:
+        source = _FakeSource(size=65536)
+        part = Partition(
+            index=1,
+            start_offset=4096,
+            length=16384,
+            scheme="GPT",
+            type_str="GPT ebd0a0a2",
+            name="Data",
+        )
+        boot_sector = bytearray(b"\x00" * 512)
+        boot_sector[3:11] = b"NTFS    "
+        boot_sector[11:13] = (512).to_bytes(2, "little")
+        boot_sector[13] = 8
+        boot_sector[40:48] = (1024).to_bytes(8, "little")
+        boot_sector[48:56] = (4).to_bytes(8, "little")
+        boot_sector[56:64] = (8).to_bytes(8, "little")
+        boot_sector[64] = 246  # -10 signed
+        boot_sector[510:512] = b"\x55\xAA"
+
+        with patch.object(bridge, "open_source", return_value=source), patch.object(
+            bridge, "scan_partitions", return_value=[part]
+        ), patch.object(
+            bridge, "safe_read_granular", return_value=bytes(boot_sector)
+        ):
+            exit_code = bridge._command_scan_partitions({"source_path": "disk.img"})
+
+        self.assertEqual(exit_code, 0)
+        partitions = self.events[-1]["partitions"]
+        self.assertEqual(partitions[0]["filesystem"], "NTFS")
+        self.assertIn("NTFS", partitions[0]["type_str"])
 
 
 if __name__ == "__main__":

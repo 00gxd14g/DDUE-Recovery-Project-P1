@@ -82,6 +82,85 @@ public class MainPageViewModelTests
     }
 
     [TestMethod]
+    public async Task ScanPartitionsAsync_AutoSelectsNtfsPartitionInsteadOfFirstSystemPartition()
+    {
+        var bridge = new FakeBridgeClient();
+        bridge.ResultFactory = command =>
+        {
+            Assert.AreEqual("scan_partitions", command);
+            return new BridgeCommandResult
+            {
+                ExitCode = 0,
+                Result = new JsonObject
+                {
+                    ["type"] = "result",
+                    ["command"] = "scan_partitions",
+                    ["partitions"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["index"] = 1,
+                            ["start_offset"] = 2048,
+                            ["length"] = 268435456,
+                            ["scheme"] = "GPT",
+                            ["type_str"] = "EFI System",
+                            ["name"] = "EFI",
+                            ["filesystem"] = "FAT32",
+                        },
+                        new JsonObject
+                        {
+                            ["index"] = 2,
+                            ["start_offset"] = 105906176,
+                            ["length"] = 250000000000,
+                            ["scheme"] = "GPT",
+                            ["type_str"] = "Basic data partition (NTFS)",
+                            ["name"] = "Windows",
+                            ["filesystem"] = "NTFS",
+                        },
+                    },
+                },
+            };
+        };
+
+        using var viewModel = CreateViewModel(bridge);
+        viewModel.SourcePath = "disk0.img";
+        await viewModel.ScanPartitionsAsync();
+
+        Assert.AreEqual(2, viewModel.SelectedPartition?.Index);
+    }
+
+    [TestMethod]
+    public async Task ConnectAsync_ValidatesSourceAndShowsConnectedStatus()
+    {
+        var bridge = new FakeBridgeClient();
+        bridge.ResultFactory = command =>
+        {
+            Assert.AreEqual("connect", command);
+            return new BridgeCommandResult
+            {
+                ExitCode = 0,
+                Result = new JsonObject
+                {
+                    ["type"] = "result",
+                    ["command"] = "connect",
+                    ["source_path"] = "disk0.img",
+                    ["size"] = 1024L,
+                    ["sector_size"] = 512,
+                    ["map_path"] = "pyddeu.map.disk0.json",
+                },
+            };
+        };
+
+        using var viewModel = CreateViewModel(bridge);
+        viewModel.SourcePath = "disk0.img";
+
+        await viewModel.ConnectAsync();
+
+        Assert.AreEqual("Connected: disk0.img", viewModel.StatusText);
+        Assert.IsTrue(viewModel.Logs.Any(log => log.Message.Contains("Connected: disk0.img")));
+    }
+
+    [TestMethod]
     public async Task ListDisksAsync_TogglesBusyStateDuringExecution()
     {
         var bridge = new FakeBridgeClient();
