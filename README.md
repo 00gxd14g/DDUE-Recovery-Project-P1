@@ -16,8 +16,16 @@ python -m pyddeu gui
 
 ### Run Windows WinUI app
 ```powershell
-dotnet build winui/PyDDEU.WinUI/PyDDEU.WinUI.csproj
-dotnet run --project winui/PyDDEU.WinUI/PyDDEU.WinUI.csproj
+powershell -ExecutionPolicy Bypass -File scripts/run_winui.ps1 -BuildOnly
+powershell -ExecutionPolicy Bypass -File scripts/run_winui.ps1
+```
+
+`scripts/run_winui.ps1` prefers the repo `.venv` Python when available, runs the bridge health check, builds the WinUI host, and supports dry-run via `-WhatIf`.
+
+Examples:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/run_winui.ps1 -WhatIf
+powershell -ExecutionPolicy Bypass -File scripts/run_winui.ps1 -BuildOnly -Configuration Release
 ```
 
 ## CLI helpers

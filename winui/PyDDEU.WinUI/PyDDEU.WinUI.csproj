@@ -20,7 +20,7 @@
         <UseRidGraph>true</UseRidGraph>
         <Platforms>x86;x64;ARM64</Platforms>
         <ApplicationManifest>app.manifest</ApplicationManifest>
-        <PublishProfile>win-$(Platform).pubxml</PublishProfile>
+        <PublishProfile Condition="'$(PublishProfile)' == '' and '$(Platform)' != '' and '$(Platform)' != 'AnyCPU'">win-$(Platform).pubxml</PublishProfile>
         <PublishTrimmed>false</PublishTrimmed>
         <PublishSingleFile>false</PublishSingleFile>
         <SelfContained>true</SelfContained>

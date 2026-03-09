@@ -13,4 +13,10 @@ dist/
 *.log
 *.sqlite
 *.sqlite3
-
+bin/
+obj/
+TestResults/
+*.coverage
+*.coverage.*
+coverage.cobertura.xml
+pyddeu.map.*.json
