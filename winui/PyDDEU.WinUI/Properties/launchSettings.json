@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "PyDDEU.WinUI (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "PyDDEU.WinUI (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

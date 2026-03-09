@@ -14,6 +14,12 @@ python -m pip install -r requirements.txt
 python -m pyddeu gui
 ```
 
+### Run Windows WinUI app
+```powershell
+dotnet build winui/PyDDEU.WinUI/PyDDEU.WinUI.csproj
+dotnet run --project winui/PyDDEU.WinUI/PyDDEU.WinUI.csproj
+```
+
 ## CLI helpers
 
 ```bash
@@ -37,6 +43,8 @@ On Linux, kernel messages are tailed via `dmesg -w`. On Windows, recent System d
 - Use `Create Image…` to write a raw `.img`/`.dd` image file to a different disk (source is never written).
 - Use `Image Selected Part…` to image only the selected carved/parsed partition (recommended when the partition table is damaged).
 - Use `Export All…` to bulk-save everything currently listed, optionally filtered by extension and Deleted/Active.
+
+In the WinUI app, `Export All` uses the `Export Extensions` field plus the `Include Deleted` / `Include Active` toggles.
 
 ## Source types
 

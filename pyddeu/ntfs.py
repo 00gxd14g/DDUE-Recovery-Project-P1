@@ -19,8 +19,12 @@ def parse_runlist(runlist_bytes: bytes) -> list[tuple[int, int]]:
             break
         length = int.from_bytes(runlist_bytes[i : i + len_bytes], "little", signed=False)
         i += len_bytes
-        offset_delta = int.from_bytes(runlist_bytes[i : i + off_bytes], "little", signed=True)
-        i += off_bytes
+        if off_bytes == 0:
+            # Sparse run: no offset field
+            offset_delta = 0
+        else:
+            offset_delta = int.from_bytes(runlist_bytes[i : i + off_bytes], "little", signed=True)
+            i += off_bytes
         runs.append((length, offset_delta))
     return runs
 

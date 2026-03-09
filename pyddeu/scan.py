@@ -22,20 +22,21 @@ WINDOWS_PANIC_CODES = frozenset({
 })
 
 # Linux errno values that indicate controller/device issues
-LINUX_PANIC_CODES = frozenset({
-    errno.EIO,         # 5: I/O error
-    errno.ENXIO,       # 6: No such device or address
-    errno.ENODEV,      # 19: No such device
-    errno.ENOMEDIUM,   # 123: No medium found (if available)
-    errno.EBUSY,       # 16: Device or resource busy
+_linux_panic_codes = {
+    errno.EIO,    # 5: I/O error
+    errno.ENXIO,  # 6: No such device or address
+    errno.ENODEV, # 19: No such device
+    errno.EBUSY,  # 16: Device or resource busy
     # NOTE: ETIMEDOUT is treated as recoverable (bad/slow media) to avoid auto-panic.
-})
+}
 
-# Add ENOMEDIUM if available (not on all systems)
-try:
-    LINUX_PANIC_CODES = LINUX_PANIC_CODES | {errno.EMEDIUMTYPE}  # 124
-except AttributeError:
-    pass
+# These are not present on all platforms (e.g. Windows).
+if hasattr(errno, "ENOMEDIUM"):
+    _linux_panic_codes.add(errno.ENOMEDIUM)  # 123: No medium found (if available)
+if hasattr(errno, "EMEDIUMTYPE"):
+    _linux_panic_codes.add(errno.EMEDIUMTYPE)  # 124: Wrong medium type
+
+LINUX_PANIC_CODES = frozenset(_linux_panic_codes)
 
 
 def _is_panic_error(e: OSError) -> bool:

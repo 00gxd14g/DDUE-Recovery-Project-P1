@@ -19,6 +19,7 @@ if not hasattr(wintypes, 'ULONG_PTR'):
         wintypes.ULONG_PTR = ctypes.c_ulong
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
 # --- Sabitler ---
 GENERIC_READ = 0x80000000
@@ -31,6 +32,12 @@ FILE_BEGIN = 0
 FILE_FLAG_OVERLAPPED = 0x40000000
 
 INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+# --- Privilege helpers ---
+TOKEN_ADJUST_PRIVILEGES = 0x0020
+TOKEN_QUERY = 0x0008
+SE_PRIVILEGE_ENABLED = 0x0002
+ERROR_NOT_ALL_ASSIGNED = 1300
 
 # --- Yapılar ---
 
@@ -124,8 +131,72 @@ kernel32.DeviceIoControl.argtypes = [
 ]
 kernel32.DeviceIoControl.restype = wintypes.BOOL
 
+class LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+
+class TOKEN_PRIVILEGES(ctypes.Structure):
+    _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+
 kernel32.GetFileSizeEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_longlong)]
 kernel32.GetFileSizeEx.restype = wintypes.BOOL
+
+kernel32.GetCurrentProcess.argtypes = []
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+advapi32.OpenProcessToken.restype = wintypes.BOOL
+
+advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+
+advapi32.AdjustTokenPrivileges.argtypes = [
+    wintypes.HANDLE,
+    wintypes.BOOL,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    ctypes.POINTER(wintypes.DWORD),
+]
+advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
+
+
+_PRIVS_TRIED = False
+
+
+def _enable_privilege(name: str) -> bool:
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ctypes.byref(token)
+    ):
+        return False
+    try:
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            return False
+        tp = TOKEN_PRIVILEGES(1, luid, SE_PRIVILEGE_ENABLED)
+        if not advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None):
+            return False
+        err = ctypes.get_last_error()
+        if err == ERROR_NOT_ALL_ASSIGNED:
+            return False
+        return True
+    finally:
+        try:
+            kernel32.CloseHandle(token)
+        except Exception:
+            pass
+
+
+def _try_enable_privileges() -> None:
+    global _PRIVS_TRIED
+    if _PRIVS_TRIED:
+        return
+    _PRIVS_TRIED = True
+    # Best-effort. These can improve raw disk access on Windows.
+    _enable_privilege("SeBackupPrivilege")
+    _enable_privilege("SeManageVolumePrivilege")
 
 
 class OVERLAPPED(ctypes.Structure):
@@ -270,6 +341,7 @@ class WindowsSyncSource(DiskSource):
 
         def worker() -> None:
             try:
+                _try_enable_privileges()
                 flags = FILE_ATTRIBUTE_NORMAL
                 if int(self._overlapped_timeout_ms or 0) > 0:
                     flags |= FILE_FLAG_OVERLAPPED
@@ -426,6 +498,7 @@ class WindowsSyncSource(DiskSource):
 
 
 def open_windows_source(path: str, *, config: PyddeuConfig | None = None) -> DiskSource:
+    _try_enable_privileges()
     cfg = config or PyddeuConfig()
     timeout = int(getattr(cfg, "deviowait_ms", 0) or 0)
 
@@ -445,7 +518,32 @@ def open_windows_source(path: str, *, config: PyddeuConfig | None = None) -> Dis
     )
 
     if handle == INVALID_HANDLE_VALUE:
-        _raise_last_error(f"CreateFileW failed for {path!r}")
+        err = ctypes.get_last_error()
+        # Access denied on PhysicalDrive: try GLOBALROOT path as a fallback.
+        if err == 5 and path.lower().startswith(r"\\.\physicaldrive"):
+            try:
+                idx = int(path.split("PhysicalDrive", 1)[-1])
+                alt_path = rf"\\?\GLOBALROOT\Device\Harddisk{idx}\DR0"
+                handle = kernel32.CreateFileW(
+                    alt_path,
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    flags,
+                    None,
+                )
+                if handle != INVALID_HANDLE_VALUE:
+                    path = alt_path
+                else:
+                    ctypes.set_last_error(err)
+                    _raise_last_error(f"CreateFileW failed for {path!r}")
+            except Exception:
+                ctypes.set_last_error(err)
+                _raise_last_error(f"CreateFileW failed for {path!r}")
+        else:
+            ctypes.set_last_error(err)
+            _raise_last_error(f"CreateFileW failed for {path!r}")
 
     size = _query_size(handle)
     sector_size = _query_sector_size(handle)
@@ -461,6 +559,7 @@ def open_windows_source(path: str, *, config: PyddeuConfig | None = None) -> Dis
 
 
 def list_physical_drives(max_index: int = 32) -> list[SourceInfo]:
+    _try_enable_privileges()
     drives: list[SourceInfo] = []
     for idx in range(max_index):
         path = rf"\\.\PhysicalDrive{idx}"
@@ -468,8 +567,51 @@ def list_physical_drives(max_index: int = 32) -> list[SourceInfo]:
             src = open_windows_source(path)
             size = src.size()
             src.close()
-            if size > 0:
-                drives.append(SourceInfo(path=path, size=size, description="PhysicalDrive"))
+            # Even if size is unknown, keep the device so the user can select it.
+            drives.append(SourceInfo(path=path, size=size, description="PhysicalDrive"))
         except OSError:
             continue
+    if drives:
+        return drives
+
+    # Fallback: use WMI via PowerShell to list disks without opening raw handles.
+    # This helps when CreateFileW is blocked by policy or antivirus.
+    try:
+        import json
+        import subprocess
+
+        ps_cmd = (
+            "Get-CimInstance Win32_DiskDrive | "
+            "Select-Object DeviceID, Size, Model | "
+            "ConvertTo-Json -Compress"
+        )
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            text=True,
+            errors="ignore",
+        )
+        if not out.strip():
+            return drives
+        data = json.loads(out)
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            device = str(item.get("DeviceID") or "").strip()
+            if not device:
+                continue
+            # Normalize to \\.\PhysicalDriveN when possible.
+            if device.upper().startswith("\\\\.\\PHYSICALDRIVE"):
+                path = "\\\\.\\" + "PhysicalDrive" + device.split("PHYSICALDRIVE", 1)[-1]
+            elif device.upper().startswith("PHYSICALDRIVE"):
+                path = "\\\\.\\" + "PhysicalDrive" + device.split("PHYSICALDRIVE", 1)[-1]
+            else:
+                path = device
+            try:
+                size_val = int(item.get("Size") or 0)
+            except Exception:
+                size_val = 0
+            model = str(item.get("Model") or "Disk").strip()
+            drives.append(SourceInfo(path=path, size=size_val, description=model))
+    except Exception:
+        return drives
+
     return drives

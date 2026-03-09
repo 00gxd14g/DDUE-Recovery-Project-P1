@@ -113,6 +113,9 @@ class PyDDEUGui:
         toolbar = ttk.Frame(self.root, padding=5)
         toolbar.pack(fill=tk.X)
 
+        self.var_aggressive_scan = tk.BooleanVar(value=False)
+        self.var_fast_list = tk.BooleanVar(value=True)
+
         ttk.Label(toolbar, text="Source:").pack(side=tk.LEFT)
         self.entry_source = ttk.Entry(toolbar, width=40)
         self.entry_source.insert(0, format_source_hint())
@@ -138,6 +141,8 @@ class PyDDEUGui:
         scans_menu = tk.Menu(scans_btn, tearoff=0)
         scans_btn["menu"] = scans_menu
         scans_menu.add_command(label="Scan Partitions", command=self.action_scan_partitions)
+        scans_menu.add_checkbutton(label="Aggressive Mode (slower)", variable=self.var_aggressive_scan)
+        scans_menu.add_checkbutton(label="Fast List (names first)", variable=self.var_fast_list)
         scans_menu.add_separator()
         scans_menu.add_command(label="Parse NTFS (pytsk3)", command=self.action_parse_fs)
         scans_menu.add_command(label="Deep Scan (NTFS MFT)", command=self.action_deep_ntfs_scan)
@@ -261,6 +266,7 @@ class PyDDEUGui:
         self.var_skip_videos = tk.BooleanVar(value=True)  # Skip large video files
         self.var_export_deleted = tk.BooleanVar(value=True)
         self.var_export_active = tk.BooleanVar(value=True)
+        self.var_show_deleted_only = tk.BooleanVar(value=False)
 
         filter_opts_btn = ttk.Menubutton(filter_frame, text="Filter Options")
         filter_opts_btn.pack(side=tk.LEFT, padx=(10, 0))
@@ -278,6 +284,8 @@ class PyDDEUGui:
         filter_opts_menu.add_separator()
         filter_opts_menu.add_checkbutton(label="Include Deleted", variable=self.var_export_deleted)
         filter_opts_menu.add_checkbutton(label="Include Active", variable=self.var_export_active)
+        filter_opts_menu.add_separator()
+        filter_opts_menu.add_checkbutton(label="Show Deleted Only (tree)", variable=self.var_show_deleted_only)
 
         # Missing files selection buttons
         ttk.Button(filter_frame, text="Select Missing", command=self.action_select_missing).pack(side=tk.LEFT, padx=(15, 2))
@@ -469,18 +477,35 @@ class PyDDEUGui:
                     nxt = s
                     break
             if nxt is not None:
-                return int(max(0, (nxt - start_lba) * 512))
+                gap_bytes = int(max(0, (nxt - start_lba) * 512))
+                # Ignore tiny gaps; they often represent alternative starts for the same volume.
+                if gap_bytes >= 1024 * 1024 * 1024:  # 1GB
+                    return gap_bytes
             if disk_size > 0:
                 return int(max(0, disk_size - int(p.start_offset)))
             return clamp_len(p)
 
-        def score(p: Partition) -> tuple[int, int, int, int]:
+        def boot_valid(p: Partition) -> int:
+            t = str(p.type_str or "").upper()
+            if "NTFS" not in t:
+                return 0
+            try:
+                from .scan import safe_read_granular
+
+                buf = safe_read_granular(src, self.state, int(p.start_offset), 512, log_cb=None, sector_size=512)
+                boot = parse_ntfs_boot_sector(buf) if buf else None
+                return 1 if boot else 0
+            except Exception:
+                return 0
+
+        def score(p: Partition) -> tuple[int, int, int, int, int]:
             t = str(p.type_str or "").upper()
             is_ntfs = 1 if "NTFS" in t else 0
+            is_boot = boot_valid(p)
             eff = span_len(p)
             clen = clamp_len(p)
             # Prefer earlier starts on ties (more likely OS/data).
-            return (is_ntfs, eff, clen, -int(p.start_offset))
+            return (is_boot, is_ntfs, eff, clen, -int(p.start_offset))
 
         chosen = max(candidates, key=score)
         try:
@@ -853,9 +878,18 @@ class PyDDEUGui:
         def worker() -> None:
             try:
                 self.state.wait_if_paused()
-                parts = scan_partitions(self.source, state=self.state, log_cb=self._log)
-                if not parts:
-                    self._log("WARNING", "No MBR/GPT partitions found. Trying optimized boot-sector carving (NTFS/exFAT/FAT32).")
+                parts = scan_partitions(
+                    self.source,
+                    state=self.state,
+                    log_cb=self._log,
+                    aggressive=bool(self.var_aggressive_scan.get()),
+                )
+                aggressive = bool(self.var_aggressive_scan.get())
+                if aggressive:
+                    self._log("WARNING", "Aggressive mode: full boot-sector carving enabled (slow).")
+                if aggressive or not parts:
+                    if not parts:
+                        self._log("WARNING", "No MBR/GPT partitions found. Trying optimized boot-sector carving (NTFS/exFAT/FAT32).")
                     total = self.source.size() or 0
 
                     def prog(off: int, total_size: int, hits: int) -> None:
@@ -894,10 +928,12 @@ class PyDDEUGui:
                             config=self.config,
                         )
                     )
-                    if carved:
-                        dedup: dict[int, Partition] = {}
+                    if carved or parts:
+                        dedup: dict[tuple[int, int], Partition] = {}
+                        for p in parts:
+                            dedup.setdefault((int(p.start_offset), int(p.length)), p)
                         for p in carved:
-                            dedup.setdefault(int(p.start_offset), p)
+                            dedup.setdefault((int(p.start_offset), int(p.length)), p)
                         parts = sorted(dedup.values(), key=lambda p: p.start_offset)
                     if not parts:
                         self._log("WARNING", "No carved NTFS/exFAT/FAT32 boot sectors found. Use RAW File Carve if needed.")
@@ -1019,6 +1055,7 @@ class PyDDEUGui:
         self._nonresident_cache = {}
         self._folder_cache = {}
         self._full_path_cache = {}
+        self._fast_seen_inodes: set[int] = set()
 
         def log_cb(level: str, msg: str) -> None:
             self._log(level, msg)
@@ -1035,16 +1072,25 @@ class PyDDEUGui:
             base_offset = int(part.start_offset)
             part_start_offset = base_offset
 
-            # Prefer cached boot info from Smart Scan - it already correctly identified
-            # which boot sector belongs to this partition (primary or backup normalized).
+            # Prefer cached boot info from Smart Scan, but verify it matches the selected start.
             boot = part.ntfs_boot
             boot_at_offset: int | None = None
-            
+
             if boot:
-                self._log("INFO", "Using cached NTFS boot info from Smart Scan.")
-                # Trust the partition's start_offset - Smart Scan already normalized it
-                boot_at_offset = base_offset
-            else:
+                # Validate the boot sector at the selected start. If invalid, re-probe.
+                try:
+                    boot_buf = safe_read_granular(src, self.state, int(base_offset), 512, log_cb=None)
+                    parsed_at_start = parse_ntfs_boot_sector(boot_buf) if boot_buf else None
+                except Exception:
+                    parsed_at_start = None
+                if parsed_at_start:
+                    boot = parsed_at_start
+                    boot_at_offset = base_offset
+                    self._log("INFO", "Using NTFS boot info from selected start offset.")
+                else:
+                    boot = None
+
+            if not boot:
                 # No cached boot - try to locate a readable boot near the selection
                 # (handles off-by-one and weak-media cases).
                 # Try primary boot, then backup boot near the end (DMDE "~x C" case),
@@ -1148,40 +1194,90 @@ class PyDDEUGui:
             from .mft import _decode_runlist_to_lcns
             
             mft_record0 = safe_read_granular(src, self.state, mft_offset, boot.file_record_size, log_cb=log_cb)
-            
-            mft_accessible = mft_record0 and len(mft_record0) >= 4 and mft_record0[:4] == b"FILE"
-            
+            mft_summary0 = None
+            if mft_record0 and len(mft_record0) >= 4:
+                mft_summary0 = parse_mft_record_best_effort(
+                    mft_record0,
+                    record_offset=int(mft_offset),
+                    mft_record_number=0,
+                    record_size=boot.file_record_size,
+                )
+
+            mft_accessible = mft_summary0 is not None
+
             if mft_accessible:
                 self._log("INFO", "MFT is accessible! Parsing $MFT data runs for fragmented MFT support...")
                 
                 # Parse $MFT record to get its data runs (MFT can be fragmented!)
                 mft_runs = []
-                try:
-                    # Find $DATA attribute (0x80) in $MFT record
-                    attr_off = struct.unpack_from("<H", mft_record0, 20)[0]
-                    off = attr_off
-                    while off + 16 <= len(mft_record0):
-                        attr_type = struct.unpack_from("<I", mft_record0, off)[0]
-                        if attr_type == 0xFFFFFFFF:
-                            break
-                        attr_len = struct.unpack_from("<I", mft_record0, off + 4)[0]
-                        if attr_len <= 0 or off + attr_len > len(mft_record0):
-                            break
-                        non_res = mft_record0[off + 8]
-                        
-                        if attr_type == 0x80 and non_res == 1:  # Non-resident $DATA
-                            run_off = struct.unpack_from("<H", mft_record0, off + 32)[0]
-                            runlist = mft_record0[off + run_off : off + attr_len]
-                            mft_runs = _decode_runlist_to_lcns(runlist)
-                            self._log("INFO", f"Found {len(mft_runs)} MFT data runs")
-                            break
-                        off += attr_len
-                except Exception as e:
-                    self._log("WARNING", f"Failed to parse $MFT data runs: {e}")
+                mft_data_size = 0
+                if mft_summary0 and mft_summary0.data_runs:
+                    mft_runs = list(mft_summary0.data_runs)
+                    mft_data_size = int(mft_summary0.data_size or 0)
+                    self._log("INFO", f"Found {len(mft_runs)} MFT data runs (via fixed MFT record)")
+                else:
+                    try:
+                        # Find $DATA attribute (0x80) in $MFT record
+                        attr_off = struct.unpack_from("<H", mft_record0, 20)[0]
+                        off = attr_off
+                        while off + 16 <= len(mft_record0):
+                            attr_type = struct.unpack_from("<I", mft_record0, off)[0]
+                            if attr_type == 0xFFFFFFFF:
+                                break
+                            attr_len = struct.unpack_from("<I", mft_record0, off + 4)[0]
+                            if attr_len <= 0 or off + attr_len > len(mft_record0):
+                                break
+                            non_res = mft_record0[off + 8]
+                            
+                            if attr_type == 0x80 and non_res == 1:  # Non-resident $DATA
+                                run_off = struct.unpack_from("<H", mft_record0, off + 32)[0]
+                                real_size = struct.unpack_from("<Q", mft_record0, off + 48)[0]
+                                mft_data_size = int(real_size)
+                                runlist = mft_record0[off + run_off : off + attr_len]
+                                mft_runs = _decode_runlist_to_lcns(runlist)
+                                self._log("INFO", f"Found {len(mft_runs)} MFT data runs")
+                                break
+                            off += attr_len
+                    except Exception as e:
+                        self._log("WARNING", f"Failed to parse $MFT data runs: {e}")
                 
                 max_records = 500000  # Safety limit for large volumes
                 mft_record_num = 0  # Actual MFT record index (inode)
                 
+                def pick_best_name(file_names: list) -> str:
+                    if not file_names:
+                        return ""
+                    priority = {1: 0, 3: 1, 0: 2, 2: 3}
+                    sorted_names = sorted(file_names, key=lambda fn: priority.get(fn.namespace, 99))
+                    return sorted_names[0].name
+
+                def maybe_fast_emit(summary) -> None:
+                    if not bool(self.var_fast_list.get()):
+                        return
+                    inode = int(summary.inode)
+                    if inode in self._fast_seen_inodes:
+                        return
+                    name = pick_best_name(summary.file_names)
+                    if not name:
+                        return
+                    self._fast_seen_inodes.add(inode)
+                    status = "DELETED" if summary.is_deleted else "ACTIVE"
+                    size = summary.data_size or (len(summary.resident_data) if summary.resident_data else 0)
+                    self.ui_queue.put(
+                        _TreeItem(
+                            path=f"[FAST] {name}",
+                            size=int(size),
+                            status=status,
+                            inode=inode,
+                            part_offset=int(part_start_offset),
+                            is_dir=False,
+                            resident_data=summary.resident_data,
+                            data_runs=summary.data_runs,
+                            data_size=summary.data_size,
+                            cluster_size=cluster_size,
+                        )
+                    )
+
                 if mft_runs:
                     # Read MFT following the data runs (fragmented MFT support)
                     for run_idx, (lcn, length_clusters) in enumerate(mft_runs):
@@ -1220,8 +1316,10 @@ class PyDDEUGui:
                                 mft_record_number=mft_record_num,
                                 record_size=boot.file_record_size,
                             )
-                            if summary and (summary.file_names or summary.resident_data is not None):
+                            if summary and (summary.file_names or summary.resident_data is not None or summary.data_runs is not None):
                                 collected.append(summary)
+                                if summary.file_names:
+                                    maybe_fast_emit(summary)
                                 
                             mft_record_num += 1
                             
@@ -1248,8 +1346,10 @@ class PyDDEUGui:
                             mft_record_number=mft_record_num,
                             record_size=boot.file_record_size,
                         )
-                        if summary and (summary.file_names or summary.resident_data is not None):
+                        if summary and (summary.file_names or summary.resident_data is not None or summary.data_runs is not None):
                             collected.append(summary)
+                            if summary.file_names:
+                                maybe_fast_emit(summary)
                             
                         mft_record_num += 1
                         offset += boot.file_record_size
@@ -1259,6 +1359,85 @@ class PyDDEUGui:
                             progress(mft_record_num, max_records)
                             
                 self._log("INFO", f"MFT scan complete: {len(collected)} files found in {mft_record_num} records")
+                # If MFT is clearly too small (corrupt or partial), fall back to brute-force scan.
+                expected_records = 0
+                if mft_data_size > 0 and boot.file_record_size > 0:
+                    expected_records = int(mft_data_size // boot.file_record_size)
+                if expected_records and mft_record_num < max(256, expected_records // 2):
+                    self._log(
+                        "WARNING",
+                        f"MFT size mismatch (expected~{expected_records}, got {mft_record_num}); falling back to brute-force scan...",
+                    )
+                    collected = []
+                    for rec in scan_and_parse_mft(
+                        src,
+                        self.state,
+                        start=part_start_offset,
+                        end=part_start_offset + boot.volume_size_bytes,
+                        step=4096,
+                        record_size=boot.file_record_size,
+                        log_cb=log_cb,
+                        progress_cb=progress,
+                    ):
+                        if self.state.stop_requested:
+                            break
+                        collected.append(rec)
+                        if len(collected) % 500 == 0:
+                            self._log("INFO", f"Deep scan parsed records: {len(collected)}")
+                elif not expected_records and mft_record_num < 512 and len(collected) < 200:
+                    self._log(
+                        "WARNING",
+                        "MFT appears too small or empty; falling back to brute-force scan for deleted records...",
+                    )
+                    collected = []
+                    for rec in scan_and_parse_mft(
+                        src,
+                        self.state,
+                        start=part_start_offset,
+                        end=part_start_offset + boot.volume_size_bytes,
+                        step=4096,
+                        record_size=boot.file_record_size,
+                        log_cb=log_cb,
+                        progress_cb=progress,
+                    ):
+                        if self.state.stop_requested:
+                            break
+                        collected.append(rec)
+                        if len(collected) % 500 == 0:
+                            self._log("INFO", f"Deep scan parsed records: {len(collected)}")
+                # Aggressive mode: always brute-force scan the volume to find deleted records.
+                if bool(self.var_aggressive_scan.get()):
+                    self._log("WARNING", "Aggressive mode: brute-force MFT scan across entire volume (slow).")
+                    seen_offsets: set[int] = set(int(r.record_offset) for r in collected)
+
+                    def brute_scan(start_off: int, step: int, label: str) -> None:
+                        self._log("WARNING", f"Aggressive mode: {label} (step={step} bytes).")
+                        for rec in scan_and_parse_mft(
+                            src,
+                            self.state,
+                            start=start_off,
+                            end=part_start_offset + boot.volume_size_bytes,
+                            step=step,
+                            record_size=boot.file_record_size,
+                            log_cb=log_cb,
+                            progress_cb=progress,
+                        ):
+                            if self.state.stop_requested:
+                                break
+                            off = int(rec.record_offset)
+                            if off in seen_offsets:
+                                continue
+                            seen_offsets.add(off)
+                            collected.append(rec)
+                            if len(collected) % 500 == 0:
+                                self._log("INFO", f"Deep scan parsed records: {len(collected)}")
+
+                    # Pass 1: aligned scan (typical 4K cluster alignment).
+                    brute_scan(part_start_offset, 4096, "brute-force MFT scan")
+
+                    # If still very low, try shifted scans (handles shifted/fragmented MFT records).
+                    if len(collected) < 500:
+                        brute_scan(part_start_offset + 4, 512, "shifted MFT scan (+4 bytes, very slow)")
             else:
                 self._log("WARNING", "MFT not accessible at expected location. Falling back to brute-force scan...")
                 # Fallback to original behavior: scan entire partition for FILE signatures
@@ -1351,7 +1530,7 @@ class PyDDEUGui:
                 paths = build_paths(collected)
                 for rec in collected:
                     status = "DELETED" if rec.is_deleted else "ACTIVE"
-                    size = len(rec.resident_data) if rec.resident_data is not None else 0
+                    size = rec.data_size or (len(rec.resident_data) if rec.resident_data is not None else 0)
                     self.ui_queue.put(
                         _TreeItem(
                             path=f"[MFT] {paths.get(rec.inode, f'inode_{rec.inode}')}",
@@ -1361,6 +1540,8 @@ class PyDDEUGui:
                             part_offset=0,
                             is_dir=False,
                             resident_data=rec.resident_data,
+                            data_runs=rec.data_runs,
+                            data_size=rec.data_size,
                         )
                     )
                 src.close()
@@ -1450,6 +1631,30 @@ class PyDDEUGui:
         Dosya yöneticisi benzeri hiyerarşik TreeView oluşturur.
         Path'i parçalara ayırır ve klasör yapısını oluşturur.
         """
+        if not hasattr(self, "_inode_node_cache"):
+            self._inode_node_cache: dict[int, str] = {}
+            self._inode_is_fast: dict[int, bool] = {}
+
+        if bool(self.var_show_deleted_only.get()) and item.status != "DELETED":
+            return
+
+        is_fast = item.path.startswith("[FAST]")
+        inode_key = int(item.inode)
+        existing_id = self._inode_node_cache.get(inode_key)
+        if existing_id and self.tree.exists(existing_id):
+            was_fast = bool(self._inode_is_fast.get(inode_key, False))
+            # If we already have a non-FAST entry, skip FAST duplicates.
+            if is_fast and not was_fast:
+                return
+            # If we have FAST and now get DEEP/MFT, replace it.
+            if not is_fast and was_fast:
+                try:
+                    self.tree.delete(existing_id)
+                except Exception:
+                    pass
+                self._inode_node_cache.pop(inode_key, None)
+                self._inode_is_fast.pop(inode_key, None)
+
         # Normalize path
         path_text = item.path.replace("\\", "/").strip("/")
         
@@ -1491,6 +1696,8 @@ class PyDDEUGui:
         file_name = parts[-1] if parts else f"inode_{item.inode}"
         node_id = self.tree.insert(parent_id, "end", text=file_name, values=(item.size, item.status, item.inode))
         self.node_metadata[node_id] = (item.part_offset, item.inode, item.is_dir)
+        self._inode_node_cache[inode_key] = node_id
+        self._inode_is_fast[inode_key] = is_fast
         
         # Store full path for recovery
         if not hasattr(self, "_full_path_cache"):

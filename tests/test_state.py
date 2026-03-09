@@ -195,8 +195,10 @@ class TestMapPathForSource(unittest.TestCase):
 
     def test_custom_directory(self):
         """Test custom directory."""
-        path = map_path_for_source("/dev/sda", directory=Path("/tmp"))
-        self.assertTrue(str(path).startswith("/tmp/pyddeu.map."))
+        root = Path("/tmp")
+        path = map_path_for_source("/dev/sda", directory=root)
+        self.assertEqual(path.parent, root)
+        self.assertTrue(path.name.startswith("pyddeu.map."))
 
     def test_unique_per_source(self):
         """Test that different sources get different paths."""

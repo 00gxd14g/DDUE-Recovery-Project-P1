@@ -288,6 +288,7 @@ def scan_partitions(
     *,
     state: Optional[RecoveryState] = None,
     log_cb: Optional[Callable[[str, str], None]] = None,
+    aggressive: bool = False,
 ) -> list[Partition]:
     # DMDE-style addressing: treat "LBA" as 512-byte units for scanning/probing,
     # even if the device reports 4K logical/physical sectors (common on USB enclosures).
@@ -324,10 +325,9 @@ def scan_partitions(
             # If GPT parse failed, return protective MBR entry (better than nothing)
             return mbr_parts
             
-        # If we found standard MBR partitions, return them
-        # BUT: if MBR table is empty (all zeros) but signature is valid, 
-        # we might want to probe anyway in case it's a "super floppy" or wiped table.
-        if mbr_parts:
+        # If we found standard MBR partitions, return them unless aggressive mode wants
+        # additional Smart Scan detection (can find alternative starts).
+        if mbr_parts and not aggressive:
             return mbr_parts
 
     # 2. If MBR invalid (read error) or Empty, TRY GPT Header directly at LBA 1
@@ -345,7 +345,7 @@ def scan_partitions(
         except Exception:
             pass
 
-    # 3. Fallback: Quick Probe with Chain Probing (Smart Scan)
+    # 3. Smart Scan with Chain Probing (DMDE-like "Found" behavior)
     # This mimics DMDE "Found" behavior: finding one partition leads to the next.
     if log_cb:
         log_cb("WARNING", "Partition table not found. Starting Smart Quick Scan (Chain Probing)...")
@@ -531,17 +531,19 @@ def scan_partitions(
             bounded_len = int(max(0, (next_start - start_lba) * DEFAULT_SECTOR_SIZE))
             if bounded_len <= 0 or bounded_len >= int(p.length):
                 continue
-            augmented.append(
-                Partition(
-                    index=int(p.index) + 1000,
-                    start_offset=int(p.start_offset),
-                    length=bounded_len,
-                    scheme=str(p.scheme),
-                    type_str=str(p.type_str) + " (bounded)",
-                    name=str(p.name),
-                    ntfs_boot=p.ntfs_boot,
+            # Ignore tiny bounded partitions (likely false positives from nearby starts).
+            if bounded_len >= 64 * 1024 * 1024:
+                augmented.append(
+                    Partition(
+                        index=int(p.index) + 1000,
+                        start_offset=int(p.start_offset),
+                        length=bounded_len,
+                        scheme=str(p.scheme),
+                        type_str=str(p.type_str) + " (bounded)",
+                        name=str(p.name),
+                        ntfs_boot=p.ntfs_boot,
+                    )
                 )
-            )
 
         augmented.sort(key=lambda pp: int(pp.start_offset))
         if log_cb:
@@ -551,6 +553,14 @@ def scan_partitions(
                 lba1 = int((p.start_offset + max(0, p.length)) // DEFAULT_SECTOR_SIZE - 1) if p.length > 0 else lba0
                 gb = float(p.length) / (1024**3) if p.length > 0 else 0.0
                 log_cb("INFO", f"FOUND: {p.type_str} LBA {lba0}..{lba1} ({gb:.2f} GB)")
+        if mbr_parts:
+            # Merge MBR with Smart Scan in aggressive mode to show alternative starts.
+            dedup: dict[tuple[int, int], Partition] = {}
+            for p in mbr_parts:
+                dedup.setdefault((int(p.start_offset), int(p.length)), p)
+            for p in augmented:
+                dedup.setdefault((int(p.start_offset), int(p.length)), p)
+            return sorted(dedup.values(), key=lambda p: int(p.start_offset))
         return augmented
 
     return []

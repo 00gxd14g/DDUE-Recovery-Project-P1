@@ -105,6 +105,44 @@ def _parse_resident_data(buf: bytes, value_off: int, value_len: int) -> bytes:
     return buf[value_off : value_off + value_len]
 
 
+def _apply_usa_fixup(record: bytes, record_size: int) -> Optional[bytes]:
+    """
+    Apply NTFS Update Sequence Array (USA) fixups to an MFT record.
+    Returns a new bytes object if successful, otherwise None.
+    """
+    if len(record) < 48 or record_size <= 0:
+        return None
+    if len(record) < record_size:
+        return None
+    try:
+        usa_off, usa_cnt = struct.unpack_from("<HH", record, 4)
+        if usa_off == 0 or usa_cnt < 2:
+            return None
+        usa_end = usa_off + usa_cnt * 2
+        if usa_end > record_size:
+            return None
+        usa = record[usa_off:usa_end]
+        if len(usa) < 2:
+            return None
+        seq = usa[0:2]
+        fixed = bytearray(record[:record_size])
+        sector_count = usa_cnt - 1
+        for i in range(sector_count):
+            sector_end = (i + 1) * 512
+            if sector_end > record_size:
+                return None
+            # Verify sequence number matches
+            if fixed[sector_end - 2 : sector_end] != seq:
+                return None
+            repl = usa[2 + i * 2 : 2 + (i + 1) * 2]
+            if len(repl) != 2:
+                return None
+            fixed[sector_end - 2 : sector_end] = repl
+        return bytes(fixed)
+    except Exception:
+        return None
+
+
 def parse_mft_record_best_effort(
     record: bytes,
     *,
@@ -128,6 +166,9 @@ def parse_mft_record_best_effort(
     """
     if len(record) < 48:
         return None
+    fixed = _apply_usa_fixup(record, record_size)
+    if fixed:
+        record = fixed
     if record[0:4] != b"FILE":
         return None
 
@@ -171,7 +212,7 @@ def parse_mft_record_best_effort(
                     data_size = len(resident_data)
         else:
             # non-resident: parse runlist (best-effort) so we can recover content without pytsk3
-            if attr_type == 0x80 and data_runs is None:
+            if attr_type == 0x80 and data_runs is None and attr_len >= 56:
                 # nonresident header: runlist offset @ +32, alloc/real sizes at +40/+48
                 run_off = struct.unpack_from("<H", record, off + 32)[0]
                 real_size = struct.unpack_from("<Q", record, off + 48)[0]
@@ -221,16 +262,18 @@ def _decode_runlist_to_lcns(runlist_bytes: bytes) -> list[tuple[Optional[int], i
             break
         length = int.from_bytes(runlist_bytes[i : i + len_bytes], "little", signed=False)
         i += len_bytes
-        offset_delta = int.from_bytes(runlist_bytes[i : i + off_bytes], "little", signed=True)
-        i += off_bytes
         if off_bytes == 0:
-            break
-        if offset_delta == 0:
-            # treat as sparse run (best-effort)
+            # Sparse run: no LCN offset field, just length
             runs.append((None, int(length)))
         else:
-            current_lcn += int(offset_delta)
-            runs.append((int(current_lcn), int(length)))
+            offset_delta = int.from_bytes(runlist_bytes[i : i + off_bytes], "little", signed=True)
+            i += off_bytes
+            if offset_delta == 0:
+                # treat as sparse run (best-effort)
+                runs.append((None, int(length)))
+            else:
+                current_lcn += int(offset_delta)
+                runs.append((int(current_lcn), int(length)))
     return runs
 
 
@@ -317,5 +360,5 @@ def scan_and_parse_mft(
                 pass
         rec = safe_read(src, state, cand.offset, record_size, log_cb=log_cb)
         summary = parse_mft_record_best_effort(rec, record_offset=cand.offset, record_size=record_size)
-        if summary and (summary.file_names or summary.resident_data is not None):
+        if summary and (summary.file_names or summary.resident_data is not None or summary.data_runs is not None):
             yield summary
