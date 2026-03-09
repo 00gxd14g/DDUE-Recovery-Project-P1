@@ -5,7 +5,7 @@ using PyDDEU.WinUI.Models;
 
 namespace PyDDEU.WinUI.Services
 {
-    public sealed class PythonBridgeClient : IDisposable
+    public sealed class PythonBridgeClient : IPythonBridgeClient
     {
         private sealed class PythonInvocation
         {
@@ -26,6 +26,12 @@ namespace PyDDEU.WinUI.Services
         public PythonBridgeClient()
         {
             _repoRoot = FindRepoRoot(AppContext.BaseDirectory);
+        }
+
+        private PythonBridgeClient(string repoRoot, string fileName, string argumentsPrefix)
+        {
+            _repoRoot = repoRoot;
+            _selectedInvocation = new PythonInvocation(fileName, argumentsPrefix);
         }
 
         public string RepoRoot
@@ -358,6 +364,11 @@ namespace PyDDEU.WinUI.Services
             }
 
             return startDirectory;
+        }
+
+        private static PythonBridgeClient CreateForTesting(string repoRoot, string fileName, string argumentsPrefix)
+        {
+            return new PythonBridgeClient(repoRoot, fileName, argumentsPrefix);
         }
 
         private void ThrowIfDisposed()

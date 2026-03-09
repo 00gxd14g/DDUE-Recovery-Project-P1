@@ -37,6 +37,24 @@ class TestWinuiBridgeOperations(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(self.events, [{"type": "result", "command": "stop", "status": "ok"}])
 
+    def test_scan_partitions_returns_result_shape(self) -> None:
+        source = _FakeSource()
+        parts = [SimpleNamespace(index=1, start_offset=2048, length=8192, scheme="GPT", type_str="Basic", name="Data")]
+
+        with patch.object(bridge, "open_source", return_value=source), patch.object(
+            bridge, "scan_partitions", return_value=parts
+        ):
+            exit_code = bridge._command_scan_partitions({"source_path": "disk.img"})
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(source.closed)
+        self.assertEqual(self.events[-1]["type"], "result")
+        self.assertEqual(self.events[-1]["command"], "scan_partitions")
+        self.assertEqual(
+            self.events[-1]["partitions"],
+            [{"index": 1, "start_offset": 2048, "length": 8192, "scheme": "GPT", "type_str": "Basic", "name": "Data"}],
+        )
+
     def test_list_disks_returns_result_shape(self) -> None:
         fake_disks = [
             SimpleNamespace(path="disk0.img", size=1024, description="Disk 0"),
@@ -137,6 +155,27 @@ class TestWinuiBridgeOperations(unittest.TestCase):
         self.assertEqual(self.events[-1]["ok"], 1)
         self.assertEqual(self.events[-1]["errors"], 0)
 
+    def test_recover_items_skips_directories(self) -> None:
+        source = _FakeSource()
+        tmp_path = Path("directory-output")
+        self.addCleanup(lambda: tmp_path.exists() and __import__("shutil").rmtree(tmp_path, ignore_errors=True))
+
+        with patch.object(bridge, "open_source", return_value=source):
+            exit_code = bridge._command_recover_items(
+                {
+                    "source_path": "disk.img",
+                    "output_root": str(tmp_path),
+                    "items": [{"path": "Users/Alice", "is_dir": True, "inode": 7}],
+                }
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(source.closed)
+        self.assertTrue((tmp_path / "Users" / "Alice").exists())
+        self.assertEqual(self.events[-1]["command"], "recover_items")
+        self.assertEqual(self.events[-1]["ok"], 0)
+        self.assertEqual(self.events[-1]["skipped"], 1)
+
     def test_deep_scan_falls_back_to_bruteforce_and_returns_files(self) -> None:
         source = _FakeSource(size=32768)
         boot = SimpleNamespace(cluster_size=4096, file_record_size=1024, volume_size_bytes=16384, mft_lcn=0)
@@ -166,6 +205,19 @@ class TestWinuiBridgeOperations(unittest.TestCase):
         self.assertEqual(self.events[-1]["command"], "deep_scan")
         self.assertEqual(self.events[-1]["count"], 2)
         self.assertEqual(self.events[-1]["raw_record_count"], 2)
+
+    def test_deep_scan_returns_not_ntfs_error_when_boot_invalid(self) -> None:
+        source = _FakeSource(size=32768)
+
+        with patch.object(bridge, "open_source", return_value=source), patch.object(
+            bridge, "safe_read_granular", return_value=b"BOOT"
+        ), patch.object(bridge, "parse_ntfs_boot_sector", return_value=None):
+            exit_code = bridge._command_deep_scan({"source_path": "disk.img", "partition_start": 4096})
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(source.closed)
+        self.assertEqual(self.events[-1]["type"], "error")
+        self.assertEqual(self.events[-1]["code"], "not_ntfs")
 
     def test_mft_scan_returns_files(self) -> None:
         source = _FakeSource(size=32768)

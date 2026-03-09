@@ -18,8 +18,8 @@ namespace PyDDEU.WinUI.ViewModels
 {
     public sealed class MainPageViewModel : INotifyPropertyChanged, IDisposable
     {
-        private readonly PythonBridgeClient _bridge = new();
-        private readonly DispatcherQueue _dispatcherQueue;
+        private readonly IPythonBridgeClient _bridge;
+        private readonly Func<Action, bool> _enqueue;
         private readonly ObservableCollection<DiskInfoModel> _disks = new();
         private readonly ObservableCollection<PartitionInfoModel> _partitions = new();
         private readonly ObservableCollection<FileEntryModel> _files = new();
@@ -45,8 +45,20 @@ namespace PyDDEU.WinUI.ViewModels
         private string _progressText = "0%";
 
         public MainPageViewModel(DispatcherQueue dispatcherQueue)
+            : this(
+                new PythonBridgeClient(),
+                action => dispatcherQueue.TryEnqueue(() => action())
+            )
         {
-            _dispatcherQueue = dispatcherQueue;
+        }
+
+        internal MainPageViewModel(
+            IPythonBridgeClient bridge,
+            Func<Action, bool> enqueue
+        )
+        {
+            _bridge = bridge;
+            _enqueue = enqueue;
             _disks.CollectionChanged += (_, _) => OnPropertyChanged(nameof(DiskCount));
             _partitions.CollectionChanged += (_, _) => OnPropertyChanged(nameof(PartitionCount));
             _files.CollectionChanged += (_, _) => OnPropertyChanged(nameof(FileCount));
@@ -723,7 +735,7 @@ namespace PyDDEU.WinUI.ViewModels
 
         private Task OnBridgeEventAsync(JsonObject evt)
         {
-            _ = _dispatcherQueue.TryEnqueue(() =>
+            _ = _enqueue(() =>
             {
                 var type = (evt["type"]?.GetValue<string>() ?? string.Empty).ToLowerInvariant();
                 if (type == "log")
