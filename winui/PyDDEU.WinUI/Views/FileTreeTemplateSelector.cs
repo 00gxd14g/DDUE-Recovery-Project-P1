@@ -17,6 +17,19 @@ namespace PyDDEU.WinUI.Views
                 item = node.Content;
             }
 
+            if (item is FileTreeNodeModel treeNode)
+            {
+                if (!treeNode.IsFolder && FileTemplate != null)
+                {
+                    return FileTemplate;
+                }
+
+                if (FolderTemplate != null)
+                {
+                    return FolderTemplate;
+                }
+            }
+
             if (item is FileEntryModel && FileTemplate != null)
             {
                 return FileTemplate;

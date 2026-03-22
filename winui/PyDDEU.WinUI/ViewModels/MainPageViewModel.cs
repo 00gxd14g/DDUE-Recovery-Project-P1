@@ -19,6 +19,7 @@ namespace PyDDEU.WinUI.ViewModels
     public sealed class MainPageViewModel : INotifyPropertyChanged, IDisposable
     {
         private readonly IPythonBridgeClient _bridge;
+        private readonly IAppLogSink _logSink;
         private readonly Func<Action, bool> _enqueue;
         private readonly ObservableCollection<DiskInfoModel> _disks = new();
         private readonly ObservableCollection<PartitionInfoModel> _partitions = new();
@@ -47,6 +48,7 @@ namespace PyDDEU.WinUI.ViewModels
         public MainPageViewModel(DispatcherQueue dispatcherQueue)
             : this(
                 new PythonBridgeClient(),
+                new FileLogSink(),
                 action => dispatcherQueue.TryEnqueue(() => action())
             )
         {
@@ -54,11 +56,14 @@ namespace PyDDEU.WinUI.ViewModels
 
         internal MainPageViewModel(
             IPythonBridgeClient bridge,
+            IAppLogSink logSink,
             Func<Action, bool> enqueue
         )
         {
             _bridge = bridge;
+            _logSink = logSink;
             _enqueue = enqueue;
+            _logSink.Initialize();
             _disks.CollectionChanged += (_, _) => OnPropertyChanged(nameof(DiskCount));
             _partitions.CollectionChanged += (_, _) => OnPropertyChanged(nameof(PartitionCount));
             _files.CollectionChanged += (_, _) => OnPropertyChanged(nameof(FileCount));
@@ -972,14 +977,15 @@ namespace PyDDEU.WinUI.ViewModels
                 return;
             }
 
-            Logs.Add(
-                new LogEntryModel
-                {
-                    Timestamp = DateTime.Now,
-                    Level = string.IsNullOrWhiteSpace(level) ? "INFO" : level.Trim().ToUpperInvariant(),
-                    Message = safeMessage,
-                }
-            );
+            var entry = new LogEntryModel
+            {
+                Timestamp = DateTime.Now,
+                Level = string.IsNullOrWhiteSpace(level) ? "INFO" : level.Trim().ToUpperInvariant(),
+                Message = safeMessage,
+            };
+
+            Logs.Add(entry);
+            _logSink.Write(entry);
 
             while (Logs.Count > 1000)
             {

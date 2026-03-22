@@ -133,6 +133,7 @@ public class MainPageViewModelTests
     public async Task ConnectAsync_ValidatesSourceAndShowsConnectedStatus()
     {
         var bridge = new FakeBridgeClient();
+        var sink = new FakeLogSink();
         bridge.ResultFactory = command =>
         {
             Assert.AreEqual("connect", command);
@@ -151,13 +152,14 @@ public class MainPageViewModelTests
             };
         };
 
-        using var viewModel = CreateViewModel(bridge);
+        using var viewModel = CreateViewModel(bridge, sink);
         viewModel.SourcePath = "disk0.img";
 
         await viewModel.ConnectAsync();
 
         Assert.AreEqual("Connected: disk0.img", viewModel.StatusText);
         Assert.IsTrue(viewModel.Logs.Any(log => log.Message.Contains("Connected: disk0.img")));
+        Assert.IsTrue(sink.Entries.Any(log => log.Message.Contains("Connected: disk0.img")));
     }
 
     [TestMethod]
@@ -361,9 +363,22 @@ public class MainPageViewModelTests
         Assert.IsTrue(viewModel.Logs.Any(log => log.Level == "WARNING" && log.Message.Contains("Operation canceled.")));
     }
 
-    private static MainPageViewModel CreateViewModel(FakeBridgeClient bridge)
+    [TestMethod]
+    public void AddLog_WritesToConfiguredSink()
     {
-        return new MainPageViewModel(bridge, action =>
+        var sink = new FakeLogSink();
+        using var viewModel = CreateViewModel(new FakeBridgeClient(), sink);
+
+        viewModel.AddLog("INFO", "terminal mirror");
+
+        Assert.AreEqual(1, sink.InitializeCallCount);
+        Assert.HasCount(1, sink.Entries);
+        Assert.AreEqual("terminal mirror", sink.Entries[0].Message);
+    }
+
+    private static MainPageViewModel CreateViewModel(FakeBridgeClient bridge, FakeLogSink? sink = null)
+    {
+        return new MainPageViewModel(bridge, sink ?? new FakeLogSink(), action =>
         {
             action();
             return true;
@@ -406,6 +421,22 @@ public class MainPageViewModelTests
 
         public void Dispose()
         {
+        }
+    }
+
+    private sealed class FakeLogSink : IAppLogSink
+    {
+        public int InitializeCallCount { get; private set; }
+        public List<LogEntryModel> Entries { get; } = new();
+
+        public void Initialize()
+        {
+            InitializeCallCount++;
+        }
+
+        public void Write(LogEntryModel entry)
+        {
+            Entries.Add(entry);
         }
     }
 }

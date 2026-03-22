@@ -7,6 +7,7 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using PyDDEU.WinUI.Models;
+using PyDDEU.WinUI.Services;
 using PyDDEU.WinUI.ViewModels;
 using Windows.Storage.Pickers;
 using WinRT.Interop;
@@ -16,6 +17,7 @@ namespace PyDDEU.WinUI.Views
     public partial class MainPage : Page
     {
         public MainPageViewModel ViewModel { get; }
+        private IReadOnlyList<FileTreeNodeModel> _treeRoots = Array.Empty<FileTreeNodeModel>();
 
         public MainPage()
         {
@@ -242,6 +244,14 @@ namespace PyDDEU.WinUI.Views
             UpdateSelectionText();
         }
 
+        private void OnFilesTreeExpanding(TreeView sender, TreeViewExpandingEventArgs args)
+        {
+            if (args.Node.Content is FileTreeNodeModel model)
+            {
+                EnsureChildren(args.Node, model);
+            }
+        }
+
         // -------------------------------------------------------------------
         // File tree building
         // -------------------------------------------------------------------
@@ -249,6 +259,7 @@ namespace PyDDEU.WinUI.Views
         private void RebuildFileTree()
         {
             FilesTreeView.RootNodes.Clear();
+            _treeRoots = Array.Empty<FileTreeNodeModel>();
 
             if (ViewModel.Files.Count == 0)
             {
@@ -256,94 +267,10 @@ namespace PyDDEU.WinUI.Views
                 return;
             }
 
-            // Track folder data separately — TreeViewNode.Content will hold UI elements
-            var folderMap = new Dictionary<string, TreeViewNode>(StringComparer.OrdinalIgnoreCase);
-            var folderInfoMap = new Dictionary<string, FolderNodeInfo>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var file in ViewModel.Files)
+            _treeRoots = FileTreeBuilder.Build(ViewModel.Files);
+            foreach (var root in _treeRoots)
             {
-                var path = (string.IsNullOrWhiteSpace(file.DisplayPath) ? file.Path : file.DisplayPath)
-                    .Replace('\\', '/')
-                    .Trim('/');
-                if (string.IsNullOrEmpty(path))
-                {
-                    path = file.Inode > 0
-                        ? string.Format("inode_{0}", file.Inode)
-                        : "unknown";
-                }
-
-                var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length == 0)
-                {
-                    continue;
-                }
-
-                TreeViewNode? parent = null;
-                var accumulated = string.Empty;
-
-                for (int i = 0; i < parts.Length; i++)
-                {
-                    accumulated = i == 0 ? parts[i] : accumulated + "/" + parts[i];
-                    bool isLeaf = i == parts.Length - 1;
-
-                    if (isLeaf && !file.IsDir)
-                    {
-                        var fileNode = new TreeViewNode
-                        {
-                            Content = BuildFileContent(file),
-                            IsExpanded = false,
-                        };
-
-                        if (parent == null)
-                        {
-                            FilesTreeView.RootNodes.Add(fileNode);
-                        }
-                        else
-                        {
-                            parent.Children.Add(fileNode);
-                        }
-
-                        // Update parent folder counts
-                        if (parent != null && folderInfoMap.TryGetValue(GetNodeKey(parent), out var parentFolder))
-                        {
-                            parentFolder.FileCount++;
-                            UpdateFolderContent(parent, parentFolder);
-                        }
-                    }
-                    else
-                    {
-                        if (!folderMap.TryGetValue(accumulated, out var folderNode))
-                        {
-                            var folderInfo = new FolderNodeInfo
-                            {
-                                Name = parts[i],
-                                FullPath = accumulated,
-                            };
-                            folderNode = new TreeViewNode
-                            {
-                                Content = BuildFolderContent(folderInfo),
-                                IsExpanded = false,
-                            };
-                            folderMap[accumulated] = folderNode;
-                            folderInfoMap[accumulated] = folderInfo;
-
-                            if (parent == null)
-                            {
-                                FilesTreeView.RootNodes.Add(folderNode);
-                            }
-                            else
-                            {
-                                parent.Children.Add(folderNode);
-                                if (parent != null && folderInfoMap.TryGetValue(GetNodeKey(parent), out var pf))
-                                {
-                                    pf.FolderCount++;
-                                    UpdateFolderContent(parent, pf);
-                                }
-                            }
-                        }
-                        parent = folderNode;
-                    }
-                }
+                FilesTreeView.RootNodes.Add(CreateTreeNode(root));
             }
 
             FileSelectionText.Text = string.Empty;
@@ -351,110 +278,11 @@ namespace PyDDEU.WinUI.Views
 
         private static string GetNodeKey(TreeViewNode node)
         {
-            // Retrieve the folder path from the Tag on the StackPanel content
-            if (node.Content is StackPanel sp && sp.Tag is string key)
+            if (node.Content is FileTreeNodeModel folder)
             {
-                return key;
+                return folder.FullPath;
             }
             return string.Empty;
-        }
-
-        private static StackPanel BuildFolderContent(FolderNodeInfo info)
-        {
-            var panel = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 6,
-                Padding = new Thickness(2),
-                Tag = info.FullPath, // used by GetNodeKey for lookup
-            };
-
-            panel.Children.Add(new FontIcon
-            {
-                Glyph = "\uE8B7",
-                FontSize = 14,
-            });
-
-            panel.Children.Add(new TextBlock
-            {
-                Text = info.Name,
-                FontSize = 13,
-                FontWeight = FontWeights.SemiBold,
-            });
-
-            panel.Children.Add(new TextBlock
-            {
-                Text = info.MetaText,
-                FontSize = 11,
-                Opacity = 0.5,
-                VerticalAlignment = VerticalAlignment.Center,
-                Tag = "meta", // marker for UpdateFolderContent
-            });
-
-            return panel;
-        }
-
-        private static void UpdateFolderContent(TreeViewNode node, FolderNodeInfo info)
-        {
-            if (node.Content is StackPanel sp)
-            {
-                foreach (var child in sp.Children)
-                {
-                    if (child is TextBlock tb && tb.Tag as string == "meta")
-                    {
-                        tb.Text = info.MetaText;
-                        break;
-                    }
-                }
-            }
-        }
-
-        private static StackPanel BuildFileContent(FileEntryModel file)
-        {
-            var panel = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 8,
-                Padding = new Thickness(2),
-                Tag = file, // store model for CollectSelectedFiles
-            };
-
-            // Status badge
-            var badgeBorder = new Border
-            {
-                Padding = new Thickness(5, 1, 5, 1),
-                CornerRadius = new CornerRadius(4),
-                Background = Application.Current.Resources["ShellAccentMutedBrush"] as Brush
-                    ?? new SolidColorBrush(Colors.Gray),
-            };
-            badgeBorder.Child = new TextBlock
-            {
-                Text = file.StatusBadge,
-                FontSize = 11,
-                FontWeight = FontWeights.SemiBold,
-            };
-            panel.Children.Add(badgeBorder);
-
-            // File name
-            panel.Children.Add(new TextBlock
-            {
-                Text = file.FileName,
-                FontSize = 13,
-                VerticalAlignment = VerticalAlignment.Center,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                MaxWidth = 400,
-            });
-
-            // Size
-            panel.Children.Add(new TextBlock
-            {
-                Text = file.SizeText,
-                FontSize = 12,
-                Opacity = 0.7,
-                VerticalAlignment = VerticalAlignment.Center,
-            });
-
-            return panel;
         }
 
         // -------------------------------------------------------------------
@@ -476,49 +304,66 @@ namespace PyDDEU.WinUI.Views
 
         private static void CollectFilesFromNode(TreeViewNode node, List<FileEntryModel> result, HashSet<string> seen)
         {
-            // Content is now a StackPanel; FileEntryModel stored in Tag
-            var file = ExtractFileModel(node);
-            if (file != null)
+            if (node.Content is FileTreeNodeModel model)
             {
-                var dedupeKey = string.IsNullOrWhiteSpace(file.DedupeKey)
-                    ? string.Format(
-                        "{0}|{1}|{2}|{3}",
-                        file.Source,
-                        file.PartOffset,
-                        file.Inode,
-                        (string.IsNullOrWhiteSpace(file.DisplayPath) ? file.Path : file.DisplayPath)
-                            .Replace('\\', '/')
-                            .Trim('/')
-                            .ToLowerInvariant()
-                    )
-                    : file.DedupeKey;
-                if (seen.Add(dedupeKey))
+                foreach (var file in FileTreeBuilder.EnumerateFiles(model))
                 {
-                    result.Add(file);
-                }
-            }
-            else
-            {
-                // Folder node - collect all children recursively
-                foreach (var child in node.Children)
-                {
-                    CollectFilesFromNode(child, result, seen);
+                    var dedupeKey = string.IsNullOrWhiteSpace(file.DedupeKey)
+                        ? string.Format(
+                            "{0}|{1}|{2}|{3}",
+                            file.Source,
+                            file.PartOffset,
+                            file.Inode,
+                            (string.IsNullOrWhiteSpace(file.DisplayPath) ? file.Path : file.DisplayPath)
+                                .Replace('\\', '/')
+                                .Trim('/')
+                                .ToLowerInvariant()
+                        )
+                        : file.DedupeKey;
+                    if (seen.Add(dedupeKey))
+                    {
+                        result.Add(file);
+                    }
                 }
             }
         }
 
         private static FileEntryModel? ExtractFileModel(TreeViewNode node)
         {
-            if (node.Content is StackPanel sp && sp.Tag is FileEntryModel file)
+            if (node.Content is FileTreeNodeModel model)
             {
-                return file;
-            }
-            // Fallback: direct Content check (shouldn't happen, but safe)
-            if (node.Content is FileEntryModel directFile)
-            {
-                return directFile;
+                return model.File;
             }
             return null;
+        }
+
+        private static TreeViewNode CreateTreeNode(FileTreeNodeModel model)
+        {
+            var node = new TreeViewNode
+            {
+                Content = model,
+                IsExpanded = false,
+            };
+
+            if (model.IsFolder && model.Children.Count > 0)
+            {
+                node.HasUnrealizedChildren = true;
+            }
+
+            return node;
+        }
+
+        private static void EnsureChildren(TreeViewNode node, FileTreeNodeModel model)
+        {
+            if (!model.IsFolder || node.Children.Count > 0)
+            {
+                return;
+            }
+
+            foreach (var child in model.Children)
+            {
+                node.Children.Add(CreateTreeNode(child));
+            }
         }
 
         private void UpdateSelectionText()
