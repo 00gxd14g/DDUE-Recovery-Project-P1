@@ -21,4 +21,4 @@ TestResults/
 *.coverage
 *.coverage.*
 coverage.cobertura.xml
-pyddeu.map.*.json
+pyddeu.map*.json
